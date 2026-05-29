@@ -90,6 +90,65 @@ Keep in mind that torch distributed is not thread safe. So try to keep the usage
 """
 
 
+def multirank_synchronous_should_self_terminate(
+    *,
+    world_size: int,
+    is_async_rollout: bool,
+    validation_enabled: bool,
+    prompt_fetch_end: bool,
+    drain_vote_sum: Optional[int],
+) -> bool:
+    """Pure decision for multi-rank *synchronous*-rollout self-termination
+    at genuine end-of-data (Option C).
+
+    A multi-rank synchronous worker cannot rely on the controller's
+    stop-carrying R->R broadcast at end-of-data: that broadcast is a
+    P2R->R2R round-trip that races the ``is_end`` signal the worker just
+    sent, and can be dropped or blocked (see
+    ``rollout_multirank_shutdown.md`` corners 1-3).  Instead every rank
+    votes "I'm drained" via a CPU/gloo all-reduce each iteration once the
+    *lockstep* ``prompt_fetch_end`` signal is observed, and the worker
+    self-terminates only when the vote is unanimous -- so all ranks leave
+    ``main_loop`` on the **same** iteration and never strand a peer in the
+    next cross-rank collective.
+
+    Scope (every clause is identical across ranks, keeping the collective
+    symmetric):
+
+    - ``world_size <= 1``: the single-process fast path already sets
+      ``shutdown_signal`` directly at ``prompt_consume_end()``; no vote.
+    - ``is_async_rollout``: the ``stream_generation_step`` path fetches on
+      local scheduler state, so ``prompt_fetch_end`` is *not* lockstep
+      there -- voting would desync the collective.  Left on its own
+      ``world_size == 1`` guard.
+    - ``validation_enabled``: the final/periodic validation is driven by
+      the controller R2R handler (``is_final_validation`` ->
+      ``do_validation`` -> ``shutdown_signal``); self-terminating here
+      would skip it.  Stays on the legacy controller-broadcast shutdown,
+      in lockstep with the controller-side ``trigger_weight_sync``
+      exclusion (which is likewise disabled when validation is on).
+
+    Args:
+        world_size: ``parallel_dims.world_size`` of the rollout worker.
+        is_async_rollout: ``True`` for the ``rollout.mode == 'async'``
+            (vllm_async) generation path.
+        validation_enabled: ``config.validation.enable``.
+        prompt_fetch_end: whether the lockstep ``prompt_fetch_end`` signal
+            has been observed (gates *entry* to the vote).
+        drain_vote_sum: SUM of per-rank drained flags (0/1) from the
+            collective vote, or ``None`` when no vote has run this
+            iteration (i.e. before ``prompt_fetch_end``).
+
+    Returns:
+        ``True`` iff this worker should set ``shutdown_signal`` now.
+    """
+    if world_size <= 1 or is_async_rollout or validation_enabled:
+        return False
+    if not prompt_fetch_end or drain_vote_sum is None:
+        return False
+    return drain_vote_sum == world_size
+
+
 class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
     """
     DisaggregatedRolloutControlWorker will be a replica instance of single DP.
@@ -352,18 +411,49 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                 self.shutdown_signal.set()
             if not self.shutdown_mp_signal.is_set():
                 self.shutdown_mp_signal.set()
+            # All joins below MUST be bounded.  Worker teardown blocking
+            # on an unresponsive controller or a wedged daemon would
+            # otherwise turn into multi-minute scheduler-timeout hangs
+            # (e.g. ``unregister_from_controller`` -> ``requests.post``
+            # to a wedged controller keeping the worker alive long
+            # enough that the orchestrator hard-kills the whole job).
+            # Worst-case delay caused by a missed join is bounded: the
+            # background/heartbeat daemons are ``daemon=True`` /
+            # ``mp.Process(daemon=True)`` with PR_SET_PDEATHSIG, so the
+            # OS will reap them when the worker process exits.
+            _JOIN_TIMEOUT_S = 15.0
             if self.background_thread is not None:
-                self.background_thread.join()
+                self.background_thread.join(timeout=_JOIN_TIMEOUT_S)
+                if self.background_thread.is_alive():
+                    logger.warning(
+                        "[Rollout] background_thread did not exit within "
+                        "%.1fs of shutdown_signal; continuing teardown "
+                        "(daemon will be reaped on process exit)",
+                        _JOIN_TIMEOUT_S,
+                    )
                 self.background_thread = None
             if self.teacher_interact_thread is not None:
-                self.teacher_interact_thread.join()
+                self.teacher_interact_thread.join(timeout=_JOIN_TIMEOUT_S)
+                if self.teacher_interact_thread.is_alive():
+                    logger.warning(
+                        "[Rollout] teacher_interact_thread did not exit "
+                        "within %.1fs of shutdown_signal; continuing teardown",
+                        _JOIN_TIMEOUT_S,
+                    )
                 self.teacher_interact_thread = None
             if self.scheduler is not None:
                 self.scheduler.stop(wait=False)
                 self.scheduler = None
 
             if self.heartbeat_thread is not None:
-                self.heartbeat_thread.join()
+                self.heartbeat_thread.join(timeout=_JOIN_TIMEOUT_S)
+                if self.heartbeat_thread.is_alive():
+                    logger.warning(
+                        "[Rollout] heartbeat process did not exit within "
+                        "%.1fs of shutdown_signal; continuing teardown "
+                        "(PR_SET_PDEATHSIG will reap it on process exit)",
+                        _JOIN_TIMEOUT_S,
+                    )
                 self.heartbeat_thread = None
             self.unregister_from_controller()
 
@@ -375,6 +465,19 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
 
     @RolloutWorkerBase.register_rollout_command_handler(BuildMeshCommand)
     def build_global_mesh(self, build_mesh_command: BuildMeshCommand):
+        # If this replica is already draining (prompt source exhausted),
+        # skip the NCCL mesh rebuild -- entering the collective would
+        # deadlock the peers that join while we exit shortly without
+        # them.  The controller-side filter on ``status.ended`` is the
+        # primary defence; this guard handles the race where a
+        # BuildMeshCommand was queued before that filter took effect.
+        if self.state.prompt_consume_end():
+            logger.info(
+                "[Rollout] Skipping BuildMeshCommand for %s: prompt "
+                "source exhausted, this replica is draining.",
+                self.replica_name,
+            )
+            return
         logger.info(f"[Rollout] Building global mesh for {self.replica_name}")
 
         replica_name_to_rank = build_mesh_command.replica_name_to_rank
@@ -1756,9 +1859,105 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
             if wst is not None:
                 wst.stop()
 
+    # Trace A + B knobs (mainloop branch counters + per-rejection log).
+    _MAINLOOP_TRACE_INTERVAL_S = 1.0
+    _VERSION_FAIL_LOG_INTERVAL_S = 5.0
+
+    def _maybe_emit_mainloop_trace(self, now):
+        """Trace A: emit a 1-Hz summary of which branch the loop took.
+
+        This is the *only* aggregated counter we keep in the rollout main
+        loop.  We do not log per-iteration -- a hot-spinning loop can
+        easily produce thousands of ``generate start`` lines per second
+        per worker, drowning out other diagnostics.  Instead we tally
+        branch hits in ``_mainloop_branch_counts`` and flush once per
+        ``_MAINLOOP_TRACE_INTERVAL_S`` (default 1s) so a stuck rollout
+        produces a handful of lines/sec, not millions.
+        """
+        if now - self._mainloop_trace_last_ts < self._MAINLOOP_TRACE_INTERVAL_S:
+            return
+        c = self._mainloop_branch_counts
+        # Skip emission when the previous window was completely idle
+        # (loop-pump was blocked elsewhere).  An entirely-zero window is
+        # itself diagnostic, but emitting a heartbeat for it on every
+        # iteration would just be noise.
+        total = sum(c.values())
+        if total == 0:
+            self._mainloop_trace_last_ts = now
+            return
+        # DEBUG: fires once per ``_MAINLOOP_TRACE_INTERVAL_S`` (1s) per
+        # worker.  Pay the volume only when explicitly debugging; the
+        # high-signal anomalies (consume_end hot-spin, version_fail
+        # bursts) are still recoverable from the per-replica counters
+        # whenever DEBUG is enabled.
+        logger.debug(
+            "[Rollout main_loop %.1fs] rank=%d empty_q=%d consume_end=%d "
+            "version_fail=%d gen_attempted=%d gen_succeeded=%d "
+            "fetched_nonempty=%d weight_unsynced=%d",
+            self._MAINLOOP_TRACE_INTERVAL_S,
+            self.global_rank,
+            c["empty_q"],
+            c["consume_end"],
+            c["version_fail"],
+            c["gen_attempted"],
+            c["gen_succeeded"],
+            c["fetched_nonempty"],
+            c["weight_unsynced"],
+        )
+        for k in c:
+            c[k] = 0
+        self._mainloop_trace_last_ts = now
+
+    def _multirank_drain_vote_enabled(self) -> bool:
+        """Whether this iteration should run the Option-C drain vote.
+
+        Every clause is identical across ranks (``world_size`` and
+        ``_is_async_rollout`` are constant; ``validation.enable`` is
+        config; ``prompt_fetch_end`` is set from the controller-broadcast
+        ``is_end`` in ``request_new_prompts`` and therefore flips on the
+        *same* iteration on every rank), so all ranks agree on whether to
+        enter the collective vote -- keeping it symmetric.
+        """
+        return (
+            self.parallel_dims.world_size > 1
+            and not self._is_async_rollout
+            and not self.config.validation.enable
+            and self.state.prompt_fetch_end()
+        )
+
+    def _multirank_drain_vote_sum(self) -> int:
+        """Collective: SUM over all ranks of the local "I'm drained" flag.
+
+        A 1-element CPU/gloo all-reduce over the worker's default process
+        group (the same group ``broadcast_object_cpu`` uses in
+        ``consume_one_command``).  MUST be called by every rank on the
+        same iteration; callers gate on ``_multirank_drain_vote_enabled``.
+        """
+        local_drained = 1 if self.state.prompt_consume_end() else 0
+        votes = torch.tensor([local_drained], dtype=torch.int64)
+        votes = dist_utils.all_reduce_tensor_object_cpu(votes, op=dist.ReduceOp.SUM)
+        return int(votes.item())
+
     def _main_loop_impl(self):
         """Core main loop extracted for clean WST lifecycle management."""
         async_mode = get_async_r2r_sync_mode(self)
+
+        # Trace A state (per-worker; legacy path only -- the async
+        # rollout path uses stream_generation_step which has its own
+        # instrumentation).
+        self._mainloop_branch_counts = {
+            "empty_q": 0,
+            "consume_end": 0,
+            "version_fail": 0,
+            "gen_attempted": 0,
+            "gen_succeeded": 0,
+            "fetched_nonempty": 0,
+            "weight_unsynced": 0,
+        }
+        self._mainloop_trace_last_ts = time.time()
+        # Trace B state.
+        self._version_fail_last_log_ts = 0.0
+
         while not self.shutdown_signal.is_set():
             self.consume_command(cmd_pred=None)
 
@@ -1770,7 +1969,42 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
             if self.validation_flag.is_set():
                 self.do_validation()
 
+            now = time.time()
+            self._maybe_emit_mainloop_trace(now)
+
+            # --- Option C: multi-rank synchronous lockstep self-terminate ---
+            # Once the controller-broadcast prompt_fetch_end signal is
+            # observed (lockstep across ranks), every rank votes each
+            # iteration on whether it has drained its (unevenly scattered)
+            # prompt share and the worker self-terminates together once the
+            # vote is unanimous.  This removes the dependency on the
+            # controller's stop-carrying R2R broadcast, which races the
+            # end-of-data signal (rollout_multirank_shutdown.md corners
+            # 1-3).  Placed above the weight_synced/generation branches so
+            # all ranks reach the collective once per iteration.
+            drain_vote_sum = (
+                self._multirank_drain_vote_sum()
+                if self._multirank_drain_vote_enabled()
+                else None
+            )
+            if multirank_synchronous_should_self_terminate(
+                world_size=self.parallel_dims.world_size,
+                is_async_rollout=self._is_async_rollout,
+                validation_enabled=self.config.validation.enable,
+                prompt_fetch_end=self.state.prompt_fetch_end(),
+                drain_vote_sum=drain_vote_sum,
+            ):
+                logger.info(
+                    "[Rollout] All %d ranks of %s drained; self-terminating "
+                    "in lockstep (Option C).",
+                    self.parallel_dims.world_size,
+                    self.replica_name,
+                )
+                self.shutdown_signal.set()
+                continue
+
             if not self.state.weight_synced():
+                self._mainloop_branch_counts["weight_unsynced"] += 1
                 continue
 
             _, is_validation, _, _ = self.report_rollouts()
@@ -1783,11 +2017,14 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                 continue
 
             if not self.state.prompt_fetch_end():
+                pre_qsize = self._prompt_queue.qsize()
                 no_more_prompts = self.request_new_prompts(
                     self.batch_size,
                     self._prompt_queue,
                     rank_in_mesh=self.rank_in_rollout_repicas,
                 )
+                if self._prompt_queue.qsize() > pre_qsize:
+                    self._mainloop_branch_counts["fetched_nonempty"] += 1
                 if no_more_prompts:
                     logger.info(
                         f"[Rollout] Receive prompt end, wait for {self.replica_name} to finish all rollouts generation"
@@ -1802,23 +2039,81 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                 assert self._prompt_queue.empty() and self.state.prompt_fetch_end(), (
                     "[Rollout] If prompt are all consumed, prompt queue should be empty and prompt end event should be set."
                 )
+                self._mainloop_branch_counts["consume_end"] += 1
+                # Mirror the async-rollout generation path
+                # (``stream_generation_step``, used when
+                # ``config.rollout.mode == "async"`` and the backend is
+                # in ``SUPPORT_ASYNC_BACKEND``): that method already
+                # calls ``self.shutdown_signal.set()`` at the analogous
+                # ``prompt_consume_end()`` site.  Without setting it
+                # here too, the default sync path leaves worker threads
+                # spinning on this branch waiting for an external
+                # ``shutdown`` broadcast that may never arrive (e.g.
+                # when the controller has already crashed).
+                #
+                # Scope the self-terminate to single-process workers
+                # (``world_size == 1``).  In a multi-rank worker the
+                # final prompt batch is scattered round-robin and
+                # *unevenly* across DP ranks, so ranks reach
+                # ``consume_end`` on different iterations.  If the first
+                # rank to drain set ``shutdown_signal`` and left
+                # ``main_loop`` here, it would strand its peers in the
+                # next cross-rank collective -> deadlock.  Multi-rank
+                # workers therefore keep the proven controller-broadcast
+                # lockstep shutdown; only single-process workers (the
+                # prefetch / bench regime that motivated this) take the
+                # self-terminate fast path.
+                if self.parallel_dims.world_size == 1:
+                    self.shutdown_signal.set()
                 continue
             elif self._prompt_queue.empty():
+                self._mainloop_branch_counts["empty_q"] += 1
                 continue
             else:
                 logger.debug(f"[Rollout] generate start for rank {self.global_rank}")
 
                 first_payload: RLPayload = self._prompt_queue.queue[0][0]
+                allowed = self.config.train.train_policy.allowed_outdated_steps
+                ceiling = self.current_weight_version + allowed
                 is_valid_prompt_for_current_weight_version = (
-                    first_payload.weight_version
-                    <= self.current_weight_version
-                    + self.config.train.train_policy.allowed_outdated_steps
+                    first_payload.weight_version <= ceiling
                 )
 
                 if not is_valid_prompt_for_current_weight_version:
+                    self._mainloop_branch_counts["version_fail"] += 1
+                    # Trace B: explain the rejection at most once per 5s
+                    # per worker.  A persistent rejection produces ~12
+                    # lines/min/worker rather than 1000+/s of
+                    # ``generate start`` lines that don't say *why*.
+                    if (
+                        now - self._version_fail_last_log_ts
+                        >= self._VERSION_FAIL_LOG_INTERVAL_S
+                    ):
+                        self._version_fail_last_log_ts = now
+                        logger.info(
+                            "[Rollout rank=%d] prompt rejected: "
+                            "prompt.weight_version=%s current_weight_version=%s "
+                            "allowed_outdated=%d ceiling=%s; head-of-queue "
+                            "will be re-checked until current_weight_version advances",
+                            self.global_rank,
+                            first_payload.weight_version,
+                            self.current_weight_version,
+                            allowed,
+                            ceiling,
+                        )
+                    # Back off before re-checking the head-of-queue
+                    # prompt.  The rejection clears as soon as the next
+                    # P->R broadcast advances ``current_weight_version``
+                    # (typically every few seconds), so without a sleep
+                    # this branch hot-spins.  50ms wakes well within
+                    # the broadcast interval and is invisible to
+                    # throughput.
+                    time.sleep(0.05)
                     continue
 
+                self._mainloop_branch_counts["gen_attempted"] += 1
                 self.one_step_generation()
+                self._mainloop_branch_counts["gen_succeeded"] += 1
 
                 if self.state.prompt_fetch_end() and self._prompt_queue.empty():
                     self.state.set_prompt_consume_end()
@@ -1929,6 +2224,30 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         Perform one step of rollout generation.
         Returns the number of valid payloads generated.
         """
+        # Trace C entry: log the head-of-queue prompt version before the
+        # blocking ``get()`` returns.  Pairs with the matching exit log
+        # below to bound generation latency.
+        _trace_c_t0 = time.time()
+        try:
+            _peek_wv = (
+                self._prompt_queue.queue[0][0].weight_version
+                if not self._prompt_queue.empty()
+                else None
+            )
+        except Exception:
+            _peek_wv = None
+        # DEBUG: fires once per generation call (~1Hz per worker).
+        # Paired with the matching ``exit`` log below for per-call
+        # latency measurements; only worth enabling for perf
+        # investigations.  See log-level rationale in the commit that
+        # introduces this demotion.
+        logger.debug(
+            "[one_step_generation entry] rank=%d cur_wv=%s peek_prompt_wv=%s",
+            self.global_rank,
+            self.current_weight_version,
+            _peek_wv,
+        )
+
         payloads_list: List[RLPayload] = self._prompt_queue.get()
 
         rollout_results: List[RolloutResult] = self._call_rollout_generation(
@@ -1940,6 +2259,14 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         )
 
         if len(rollout_results) == 0:
+            # DEBUG: see entry-log rationale above.
+            logger.debug(
+                "[one_step_generation exit] rank=%d elapsed_ms=%.1f "
+                "batch=%d produced=0 returned_false=True",
+                self.global_rank,
+                (time.time() - _trace_c_t0) * 1000.0,
+                len(payloads_list),
+            )
             return False
 
         assert len(rollout_results) == len(payloads_list), (
@@ -1948,9 +2275,19 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
 
         logger.debug(f"[Rollout] generate end for rank {self.global_rank}")
 
-        return self._filter_valid_rollout_results_and_report(
+        result = self._filter_valid_rollout_results_and_report(
             rollout_results, payloads_list
         )
+        # DEBUG: see entry-log rationale above.
+        logger.debug(
+            "[one_step_generation exit] rank=%d elapsed_ms=%.1f "
+            "batch=%d produced=%d returned_false=False",
+            self.global_rank,
+            (time.time() - _trace_c_t0) * 1000.0,
+            len(payloads_list),
+            len(rollout_results),
+        )
+        return result
 
     def _stream_generation_feed_prompts(
         self,
@@ -2078,7 +2415,17 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         if self.state.prompt_consume_end():
             # Send end signal to the controller
             # Because we first report_rollouts() to the controller, so we don't need to check the reward_dispatcher queue here.
-            self.shutdown_signal.set()
+            #
+            # Scope the self-terminate to single-process workers
+            # (``world_size == 1``); see the matching guard in the
+            # synchronous ``_main_loop_impl`` consume-end branch.  A
+            # multi-rank async worker would otherwise strand its peers
+            # in the next cross-rank collective when the first rank to
+            # exhaust its (unevenly scattered) prompt share leaves
+            # ahead of the others.  Multi-rank workers shut down via
+            # the controller stop-broadcast instead.
+            if self.parallel_dims.world_size == 1:
+                self.shutdown_signal.set()
             if self.global_rank == 0:
                 self.send_end_signal()
 

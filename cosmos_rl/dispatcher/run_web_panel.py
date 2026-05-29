@@ -15,6 +15,7 @@
 
 import os
 import argparse
+import signal
 import uvicorn
 import toml
 from fastapi import FastAPI
@@ -52,7 +53,10 @@ from cosmos_rl.dispatcher.protocol import (
 from cosmos_rl.policy.config import Config as CosmosConfig
 from cosmos_rl.utils.network_util import find_available_port
 from cosmos_rl.utils.logging import logger
-from cosmos_rl.utils.constant import COSMOS_ROLLOUT_SCAN_INTERVAL
+from cosmos_rl.utils.constant import (
+    COSMOS_ROLLOUT_SCAN_INTERVAL,
+    COSMOS_SHUTDOWN_ON_NO_POLICY_REPLICAS,
+)
 from cosmos_rl.utils.api_suffix import (
     COSMOS_API_PANEL_SUFFIX,
     COSMOS_API_STATUS_SUFFIX,
@@ -108,12 +112,55 @@ async def lifespan(app: FastAPI):
     loop = asyncio.get_running_loop()
 
     def monitor_replica_status():
+        # Tracks whether we ever observed a live policy replica so the
+        # "all dead" transition is distinguishable from the cold-start
+        # state.  Only consulted when
+        # ``COSMOS_SHUTDOWN_ON_NO_POLICY_REPLICAS`` is set; otherwise
+        # this stays unused.
+        had_policy_replicas = False
         while not shutdown_event.is_set():
             # Run in separate process
             controller.policy_status_manager.maintain_life_status()
             controller.rollout_status_manager.maintain_life_status(
                 controller.policy_status_manager
             )
+
+            # Opt-in escalation of "all policy replicas dead" to a
+            # controller-wide shutdown.  Default OFF because
+            # cosmos-rl supports dynamic replica scaling -- intentional
+            # scale-to-zero (model swap, maintenance) and rolling
+            # restart (old replica unregisters before new one
+            # registers) both transit ``len(policy_replicas) == 0`` as
+            # a legitimate state.  Treating it as fatal there would
+            # kill the controller during normal operation and prevent
+            # the orchestrator from bringing replicas back.
+            #
+            # The escalation IS appropriate in deployments without
+            # auto-respawn (one trainer process per job, no
+            # replacement on death).  Without it, a trainer crash that
+            # the heartbeat thread correctly reports leaves the
+            # controller idle until the orchestrator's wall-clock
+            # timeout, which can burn significant cluster time.  Those
+            # deployments set ``COSMOS_SHUTDOWN_ON_NO_POLICY_REPLICAS=1``
+            # to enable the SIGTERM-self path below; FastAPI then runs
+            # its lifespan shutdown cleanly and the process exits,
+            # freeing the allocation immediately.
+            if COSMOS_SHUTDOWN_ON_NO_POLICY_REPLICAS:
+                n_policy = len(controller.policy_status_manager)
+                if n_policy > 0:
+                    had_policy_replicas = True
+                elif had_policy_replicas:
+                    logger.error(
+                        "[Controller] All policy replicas are dead and "
+                        "COSMOS_SHUTDOWN_ON_NO_POLICY_REPLICAS is set.  "
+                        "Initiating controller shutdown so the scheduling "
+                        "layer (SLURM, etc.) can release the job instead "
+                        "of waiting for the wall-clock timeout."
+                    )
+                    shutdown_event.set()
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    break
+
             if shutdown_event.wait(timeout=COSMOS_ROLLOUT_SCAN_INTERVAL):
                 break  # Exit early if shutdown signaled during sleep
 
@@ -440,15 +487,27 @@ async def put_rollout_group(rollout: RolloutRequest):
             )
             controller.rollout_status_manager.rollout_end(rollout.src_replica_name)
             if controller.rollout_status_manager.all_rollouts_ended():
-                total_pending_rollouts = (
+                # Use ``samples_on_the_fly`` (= rollouts in buffer + rollouts
+                # mid-flight on workers) rather than ``total_pending_rollouts()``
+                # (= buffer only).  Once all rollout workers have signalled
+                # end-of-data, any sample still mid-flight on a worker is the
+                # last we'll ever see of that prompt, and it WILL land in the
+                # buffer before the worker exits.  Undercounting here lowers
+                # ``total_steps`` to a value the trainer can never reach if the
+                # remaining samples land just after recompute, producing an
+                # end-of-run deadlock (trainer waits for data_fetch=N that the
+                # controller will never send because it thinks training is
+                # finished).
+                remaining_samples = controller.policy_status_manager.samples_on_the_fly
+                pending_in_buffer = (
                     controller.policy_status_manager.total_pending_rollouts()
                 )
                 logger.info(
-                    f"[Controller] All rollouts have ended, recompute total steps with {total_pending_rollouts} remaining rollouts..."
+                    f"[Controller] All rollouts have ended, recompute total steps with {remaining_samples} remaining samples ({pending_in_buffer} in buffer + {remaining_samples - pending_in_buffer} mid-flight on workers)..."
                 )
                 original_total_steps = controller.policy_status_manager.total_steps
                 controller.policy_status_manager.recompute_total_steps(
-                    explicit_num_remaining_samples=total_pending_rollouts
+                    explicit_num_remaining_samples=remaining_samples
                 )
                 new_total_steps = controller.policy_status_manager.total_steps
                 if new_total_steps > controller.policy_status_manager.current_step:

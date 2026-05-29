@@ -37,6 +37,39 @@ import numpy as np
 from cosmos_rl.utils.util import aggregate_report_data
 
 
+# ---------------------------------------------------------------------------
+# Trace F -- ``samples_on_the_fly`` mutation tracker.
+# ---------------------------------------------------------------------------
+# Every call site that mutates ``PolicyStatusManager.samples_on_the_fly``
+# routes through ``_log_sotf_mutation`` so a single ``rg`` of the controller
+# log reconstructs the full trajectory of the counter, with the call-site
+# tag, the delta, and the before/after values.  Used as a regression net
+# against future re-introductions of the fake-last-cmd underflow (see the
+# ``samples_on_the_fly`` accounting comments at the call sites below).
+# Low-volume by construction: only the two real mutation sites
+# (``filter_outdated_rollouts``, ``train_ack``) emit -- the dispatch-side
+# increment is intentionally NOT wrapped here because it fires on every
+# batched-prompt request including throttled empty fetches, which used to
+# dominate steady-state log volume.
+def _log_sotf_mutation(
+    source: str,
+    before: int,
+    after: int,
+    *,
+    extra: str = "",
+) -> None:
+    delta = after - before
+    extra_str = f" {extra}" if extra else ""
+    logger.info(
+        "[Controller sotf] source=%s before=%d delta=%+d after=%d%s",
+        source,
+        before,
+        delta,
+        after,
+        extra_str,
+    )
+
+
 class ReplicaScalingEnum(StrEnum):
     """
     Enum for replica scaling event.
@@ -116,6 +149,21 @@ class PolicyStatusManager:
         self.rollout_buffer = Queue()
         self.remain_samples_num = 0
         self.samples_on_the_fly = 0
+
+        # Per-step record of how many rollouts the controller dispatched for
+        # each training step.  Populated at dispatch time by
+        # ``try_trigger_data_fetch_and_training`` (which knows the real count,
+        # including the ``is_fake_last_cmd`` case where it is zero) and
+        # consumed by ``train_ack`` to compute the symmetric
+        # ``samples_on_the_fly`` decrement.  Without this, ``train_ack``
+        # decrements by ``train_batch_per_replica * arrived_replicas``
+        # unconditionally, which underflows the counter on the fake-last-cmd
+        # path (dispatched zero, decrements two) and trips the
+        # ``samples_on_the_fly >= 0`` assertion.  Keyed by ``current_step``
+        # value at dispatch (= ``global_step`` sent in DataFetchCommand =
+        # ``step`` received in train_ack); entries are popped on ack so the
+        # map size stays bounded by in-flight step count.
+        self.dispatched_rollouts_by_step: Dict[int, int] = {}
 
         self.status = {}
 
@@ -840,15 +888,30 @@ class PolicyStatusManager:
                 logger.debug(
                     f"[Controller] Filtered out outdated rollout with version {rollout.weight_version}, current step {self.current_step}, estimated step {estimated_step}, pending rollouts {self.total_pending_rollouts()}, preceeding rollouts in this batch {idx}, allowed_outdated_steps {self.config.train.train_policy.allowed_outdated_steps}"
                 )
-        # Update remaining samples number
-        self.remain_samples_num -= len(rollouts) - len(filtered_rollouts)
-        k = "outdated"
-        self.filter_records[k] = (
-            self.filter_records.get(k, 0) + len(rollouts) - len(filtered_rollouts)
-        )
 
         discarded_count = len(rollouts) - len(filtered_rollouts)
+
+        # Update remaining samples number
+        self.remain_samples_num -= discarded_count
+        k = "outdated"
+        self.filter_records[k] = self.filter_records.get(k, 0) + discarded_count
+
         if discarded_count > 0:
+            # Filtered rollouts were counted into ``samples_on_the_fly`` at
+            # dispatch time (controller._get_batched_prompt_impl) but are
+            # dropped here without ever reaching ``train_ack``, where the
+            # symmetric decrement lives.  Without this clamp the counter
+            # drifts upward on every filter event and eventually pins the
+            # soft throttle on permanently — the system loses its
+            # rollout-parallel regime and never autonomically recovers.
+            _sotf_before = self.samples_on_the_fly
+            self.samples_on_the_fly = max(0, self.samples_on_the_fly - discarded_count)
+            _log_sotf_mutation(
+                "filter_outdated",
+                _sotf_before,
+                self.samples_on_the_fly,
+                extra=f"discarded_count={discarded_count}",
+            )
             self._publish_payload_transport_cleanup(rollouts, filtered_rollouts)
 
         return filtered_rollouts
@@ -1009,8 +1072,48 @@ class PolicyStatusManager:
         self.set_status(replica_name, PolicyStatus.REDUCED)
 
         if self.all_reduced():
-            self.samples_on_the_fly -= self.config.train.train_batch_per_replica * len(
-                self.get_all_atoms_arrived_replicas()
+            _sotf_before = self.samples_on_the_fly
+            # Decrement by the actual rollout count we dispatched for this
+            # step (recorded in ``try_trigger_data_fetch_and_training``),
+            # NOT by ``train_batch_per_replica * arrived_replicas``.  The
+            # two are equal on normal steps but diverge on the
+            # ``is_fake_last_cmd`` step, where the controller dispatches
+            # zero rollouts but the trainer still acks.  Without the
+            # symmetric lookup, that ack underflows the counter and trips
+            # the ``samples_on_the_fly >= 0`` assertion below.
+            _train_decrement = self.dispatched_rollouts_by_step.pop(step, 0)
+            if _train_decrement == 0 and step not in (
+                self.total_steps,
+                self.total_steps - 1,
+            ):
+                # Unexpected: a non-fake step popped 0.  Either the
+                # dispatch record was already consumed (double-ack) or a
+                # step number is mismatched.  Log loudly but do not crash;
+                # ``samples_on_the_fly`` stays balanced regardless.
+                logger.warning(
+                    "[Controller] train_ack for step=%d found no dispatch "
+                    "record (current_step=%d total_steps=%d).  "
+                    "Decrementing samples_on_the_fly by 0; this may "
+                    "indicate a double-ack or step-numbering bug.",
+                    step,
+                    self.current_step,
+                    self.total_steps,
+                )
+            self.samples_on_the_fly -= _train_decrement
+            # Trace F: cross-reference with the dispatch-side records and
+            # filter events in this same log.  Now that ``_train_decrement``
+            # comes from a per-step record, ``before - after == recorded
+            # dispatch`` always holds and the assertion below should never
+            # fire.  The trace stays as a regression net so any future
+            # accounting drift is caught immediately.
+            _log_sotf_mutation(
+                "train_ack",
+                _sotf_before,
+                self.samples_on_the_fly,
+                extra=(
+                    f"step={step} replica={replica_name} "
+                    f"recorded_dispatch={_train_decrement}"
+                ),
             )
             assert self.samples_on_the_fly >= 0, (
                 "samples_on_the_fly should not be negative"
@@ -1228,7 +1331,26 @@ class PolicyStatusManager:
             rollout_status_manager.get_all_atoms_arrived_replicas(),
             key=lambda x: x.start_time,
         )
+        # Exclude rollout replicas that have already signalled end-of-data
+        # (``status.ended``) from the P2R/R2R weight-sync set.  A replica
+        # that POSTed ``is_end`` self-terminates at ``prompt_consume_end``
+        # (the rollout-side Option C drain vote), so it is leaving
+        # ``main_loop`` and will stop servicing the P2R recv / R2R
+        # broadcast -- still targeting it would block the policy's NCCL
+        # send (corner 1) or strand the broadcast (corners 2/3); see
+        # rollout_multirank_shutdown.md.
+        #
+        # Gated on ``not validation.enable`` to stay symmetric with the
+        # rollout-side self-terminate: when validation is enabled the
+        # rollout does NOT self-terminate (the final validation is driven
+        # by the controller R2R handler), so it must keep receiving the
+        # weight sync.  Disabling the exclusion here in that case
+        # guarantees the two sides never disagree (one excluding while the
+        # other waits -> new deadlock).
+        exclude_ended = not self.config.validation.enable
         for rollout_replica in sorted_replicas:
+            if exclude_ended and rollout_replica.status.ended:
+                continue
             if any_loaded_rollout_replica is None:
                 any_loaded_rollout_replica = rollout_replica
             valid_rollout_replicas.append(rollout_replica)
@@ -1344,6 +1466,16 @@ class PolicyStatusManager:
 
             # From controller's perspective, the training step is already increased
             self.current_step += 1
+
+            # Record the actual rollout count dispatched for this step so
+            # ``train_ack`` can later decrement ``samples_on_the_fly`` by the
+            # symmetric amount.  ``required_rollouts`` is the authoritative
+            # count: ``train_batch_per_replica * len(arrived_replicas)`` on a
+            # normal step, ``0`` on the ``is_fake_last_cmd`` step (line 1388
+            # above).  Keyed by ``current_step`` which is exactly the
+            # ``global_step`` we send in DataFetchCommand below and the
+            # ``step`` the trainer echoes back via train_ack.
+            self.dispatched_rollouts_by_step[self.current_step] = required_rollouts
 
             if self.config.validation.enable and (
                 self.current_step % self.config.validation.freq == 0
@@ -1569,8 +1701,29 @@ class RolloutStatusManager:
             # Do not trigger rebuild mesh since everything is gonna be finished shortly
             logger.info(f"[Controller] Replica {replica_name} is stopping.")
             return
-        if replica.in_mesh and len(self.rollout_replicas) > 0:
-            self.trigger_rebuild_mesh(self.get_all_atoms_arrived_replicas())
+
+        # Restrict the BuildMesh recipient set to replicas that have NOT
+        # already signalled ``rollout_end`` (``status.ended``).  A
+        # replica that has POSTed its final batch is on its way out of
+        # ``main_loop`` and will stop draining its command queue, so
+        # including it in the rebuild leaves a live peer waiting on a
+        # collective that will never complete.  Also require
+        # ``len(live_survivors) >= 2`` before triggering -- a 1-member
+        # rebuild is pointless and skipping it makes the decision
+        # audible in the log.
+        live_survivors = [
+            r for r in self.get_all_atoms_arrived_replicas() if not r.status.ended
+        ]
+        if replica.in_mesh and len(live_survivors) >= 2:
+            self.trigger_rebuild_mesh(live_survivors)
+        elif replica.in_mesh:
+            logger.info(
+                "[Controller] Replica %s unregistering with %d live "
+                "survivor(s); skipping mesh rebuild "
+                "(graceful end-of-data path or last-replica teardown).",
+                replica_name,
+                len(live_survivors),
+            )
 
     def register(
         self,

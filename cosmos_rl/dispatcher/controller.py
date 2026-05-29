@@ -46,6 +46,7 @@ from cosmos_rl.dispatcher.protocol import SetProfileRequest
 from cosmos_rl.utils.parallelism_map import ParallelizedShardMapper
 from cosmos_rl.dispatcher.data.schema import RLPayload
 from cosmos_rl.dispatcher.data.data_fetcher import ControllerDataFetcher
+from cosmos_rl.dispatcher.command import snapshot_dispatch_state
 
 
 class Controller:
@@ -73,6 +74,12 @@ class Controller:
         # nccl error check
         self.post_ncclerror_policy_invoke_id = 0
         self.post_ncclerror_rollout_invoke_id = 0
+        # Soft-throttle dedup state (see _update_soft_throttle_state).
+        # ``_soft_throttle_engaged_since`` is None when not engaged, else
+        # wall-clock ts of entry; ``_soft_throttle_last_log_ts`` is the
+        # last time we emitted a heartbeat while engaged.
+        self._soft_throttle_engaged_since: Optional[float] = None
+        self._soft_throttle_last_log_ts: float = 0.0
 
     def _init_dist(self):
         self.config = None
@@ -242,6 +249,96 @@ maxmemory-policy allkeys-lfu
     ) -> Tuple[List[RLPayload], bool]:
         return await self._get_batched_prompt_impl(n, validation_step, rank_in_mesh)
 
+    _SOFT_THROTTLE_HEARTBEAT_S = 5.0
+
+    def _update_soft_throttle_state(
+        self,
+        *,
+        engaged: bool,
+        current_pending: int,
+        threshold: int,
+        allowed_outdated_steps: int,
+        rollouts_per_global_batch: int,
+    ) -> None:
+        """Emit entry / heartbeat / exit logs for the non-DAPO soft throttle.
+
+        The throttle silently returns ``payloads=[]`` to rollout workers
+        whenever ``samples_on_the_fly >= threshold`` and
+        ``outdated_rollout_fetch_batch_size == 0`` (the common config),
+        which is invisible in the controller log.  This helper makes the
+        transitions audible without flooding: log on entry, then once
+        every ``_SOFT_THROTTLE_HEARTBEAT_S`` seconds while still engaged,
+        plus a release line when the counter drops back below the
+        threshold.
+        """
+        now = time.time()
+        emitted_event = None  # one of {"engaged", "heartbeat", "released"}
+        if engaged:
+            if self._soft_throttle_engaged_since is None:
+                self._soft_throttle_engaged_since = now
+                self._soft_throttle_last_log_ts = now
+                logger.info(
+                    "[Controller] Soft throttle ENGAGED: "
+                    "samples_on_the_fly=%d >= threshold=%d "
+                    "(allowed_outdated_steps=%d, "
+                    "rollouts_per_global_batch=%d); rollout workers will "
+                    "receive empty payload lists until the counter drops.",
+                    current_pending,
+                    threshold,
+                    allowed_outdated_steps,
+                    rollouts_per_global_batch,
+                )
+                emitted_event = "engaged"
+            elif (
+                now - self._soft_throttle_last_log_ts >= self._SOFT_THROTTLE_HEARTBEAT_S
+            ):
+                self._soft_throttle_last_log_ts = now
+                duration = now - self._soft_throttle_engaged_since
+                logger.info(
+                    "[Controller] Soft throttle still engaged after %.1fs: "
+                    "samples_on_the_fly=%d threshold=%d",
+                    duration,
+                    current_pending,
+                    threshold,
+                )
+                emitted_event = "heartbeat"
+        else:
+            if self._soft_throttle_engaged_since is not None:
+                duration = now - self._soft_throttle_engaged_since
+                self._soft_throttle_engaged_since = None
+                logger.info(
+                    "[Controller] Soft throttle RELEASED after %.1fs: "
+                    "samples_on_the_fly=%d < threshold=%d",
+                    duration,
+                    current_pending,
+                    threshold,
+                )
+                emitted_event = "released"
+
+        # Trace D: command-pump readout on every soft-throttle log event.
+        # Reading the snapshot is O(dict copy) so this is cheap; emitting it
+        # only when the throttle log already fires keeps log volume bounded
+        # by the existing throttle cadence.
+        if emitted_event is not None:
+            ds = snapshot_dispatch_state()
+            last_ts = ds["last_dispatch_ts"]
+            since = (now - last_ts) if last_ts is not None else None
+            since_str = "n/a" if since is None else f"{since:.1f}s"
+            logger.info(
+                "[Controller cmd-pump] event=%s data_fetch=%d "
+                "policy_to_rollout_unicast=%d rollout_to_rollout_broadcast=%d "
+                "last_data_fetch_step=%s last_unicast_step=%s "
+                "last_broadcast_step=%s since_last_dispatch=%s",
+                emitted_event,
+                ds["data_fetch_count"],
+                ds["policy_to_rollout_unicast_count"],
+                ds["rollout_to_rollout_broadcast_count"],
+                ds["last_data_fetch_step"],
+                ds["last_unicast_step"],
+                ds["last_broadcast_step"],
+                since_str,
+            )
+
     async def _get_batched_prompt_impl(
         self,
         n: int,
@@ -288,18 +385,35 @@ maxmemory-policy allkeys-lfu
             # 1. Detect the current left pending rollouts in all policy replicas.
             # 2. Check the config.train.train_policy.allowed_outdated_steps.
             # 3. If the current pending rollouts is larger than the allowed outdated version count, reduce the number of prompts to generate.
-            if (
-                current_pending_rollouts
-                >= (self.config.train.train_policy.allowed_outdated_steps + 1)
-                * rollouts_per_global_batch
-            ) and self.config.train.train_policy.variant != "dapo":
+            allowed_outdated_steps = (
+                self.config.train.train_policy.allowed_outdated_steps
+            )
+            soft_throttle_threshold = (
+                allowed_outdated_steps + 1
+            ) * rollouts_per_global_batch
+            soft_throttle_engaged = (
+                current_pending_rollouts >= soft_throttle_threshold
+                and self.config.train.train_policy.variant != "dapo"
+            )
+            self._update_soft_throttle_state(
+                engaged=soft_throttle_engaged,
+                current_pending=current_pending_rollouts,
+                threshold=soft_throttle_threshold,
+                allowed_outdated_steps=allowed_outdated_steps,
+                rollouts_per_global_batch=rollouts_per_global_batch,
+            )
+            if soft_throttle_engaged:
+                original_n = n
                 n = min(
                     n,
                     self.config.train.train_policy.outdated_rollout_fetch_batch_size,
                 )
-                if n > 0:
+                # Only emit the legacy "n reduced from X to Y > 0" warning
+                # when the throttle clamps to a non-zero batch.  The n == 0
+                # case is now covered by _update_soft_throttle_state above.
+                if 0 < n < original_n:
                     logger.warning(
-                        f"[Controller] Current pending rollouts {current_pending_rollouts} is larger than the allowed outdated version count {self.config.train.train_policy.allowed_outdated_steps * len(self.policy_status_manager)}. Generate with batch {n}"
+                        f"[Controller] Current pending rollouts {current_pending_rollouts} is larger than the allowed outdated version count {allowed_outdated_steps * len(self.policy_status_manager)}. Generate with batch {n}"
                     )
             if (
                 self.config.train.train_policy.variant == "dapo"
@@ -462,9 +576,37 @@ maxmemory-policy allkeys-lfu
                 else:
                     payloads_list[i].weight_version = 0
         if not is_validation:
+            pre_dispatch_in_flight = self.policy_status_manager.samples_on_the_fly
             self.policy_status_manager.samples_on_the_fly += (
                 current_fetch_count * self.config.rollout.n_generation
             )
+            # NOTE: a dispatch-site Trace-F mutation log used to live here
+            # while we were chasing the samples_on_the_fly underflow.  It
+            # fired on every call to ``_get_batched_prompt_impl`` -- including
+            # the throttled empty-fetch (``current_fetch_count == 0``,
+            # ``delta == +0``) which dominates steady state -- and bloated
+            # controller logs to ~1 GB on long runs.  The dispatch path is
+            # now sufficiently observable via Trace E below (logs only
+            # non-empty dispatches) and via the new
+            # ``dispatched_rollouts_by_step`` map consumed by ``train_ack``
+            # in ``status.py``, so this site no longer needs a mutation log.
+            # Trace E: log every non-empty prompt dispatch with the stamped
+            # weight version and pre/post in-flight counter.  Empty dispatches
+            # (the silent-throttle 35-byte response) are intentionally NOT
+            # logged here -- the throttle helper above already accounts for
+            # those.  Correlate ``stamped_weight_version`` against the
+            # rollout-side Trace B to detect prompt/weight mismatches.
+            if current_fetch_count > 0 and payloads_list:
+                stamped_wv = getattr(payloads_list[0], "weight_version", None)
+                logger.info(
+                    "[Controller dispatch] rank_in_mesh=%s n=%d "
+                    "stamped_weight_version=%s in_flight=%d->%d",
+                    rank_in_mesh,
+                    current_fetch_count,
+                    stamped_wv,
+                    pre_dispatch_in_flight,
+                    self.policy_status_manager.samples_on_the_fly,
+                )
 
         return payloads_list, is_end
 
@@ -525,10 +667,25 @@ maxmemory-policy allkeys-lfu
 
         # Print pending rollouts inside all policy replicas
         pending_count = self.policy_status_manager.total_pending_rollouts()
+        in_flight_count = self.policy_status_manager.samples_on_the_fly
+        outdated_filtered_count = self.policy_status_manager.filter_records.get(
+            "outdated", 0
+        )
 
         elapsed_time_in_seconds = time.time() - self.begin_time
+        # ``pending_count`` is what's queued in rollout_buffer awaiting the
+        # trainer; ``in_flight_count`` (samples_on_the_fly) is the throttle
+        # input — prompts dispatched but not yet trained-on, including
+        # both rollouts mid-flight on workers and rollouts in the buffer.
+        # Drift in ``in_flight_count`` against ``outdated_filtered_count``
+        # is the leading indicator of soft-throttle pinning.
         logger.info(
-            f"[Controller] Stat: {self.stat_n_samples} samples, {self.stat_completion_tokens_count} completion tokens, {pending_count} pending rollouts, {elapsed_time_in_seconds} seconds elapsed"
+            f"[Controller] Stat: {self.stat_n_samples} samples, "
+            f"{self.stat_completion_tokens_count} completion tokens, "
+            f"{pending_count} pending rollouts, "
+            f"{in_flight_count} in-flight, "
+            f"{outdated_filtered_count} filtered (outdated), "
+            f"{elapsed_time_in_seconds:.2f}s elapsed"
         )
 
     """
