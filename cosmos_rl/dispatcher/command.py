@@ -15,6 +15,7 @@
 
 from typing import Dict, List, Optional, Type, Callable
 import copy
+import time
 import uuid
 from abc import ABC
 from strenum import StrEnum
@@ -22,6 +23,50 @@ import msgpack
 from cosmos_rl.dispatcher.replica import Replica
 from cosmos_rl.dispatcher.protocol import Role
 from cosmos_rl.utils.redis_stream import RedisStreamHandler
+
+
+# ---------------------------------------------------------------------------
+# Trace D -- controller command-pump dispatch tracker.
+# ---------------------------------------------------------------------------
+# Module-level rolling counters of commands actually queued onto Redis from
+# the controller side.  Each ``Command.trigger`` classmethod calls
+# ``record_dispatch`` after ``redis_handler.publish_command`` returns; the
+# controller's soft-throttle heartbeat reads ``snapshot_dispatch_state()`` to
+# emit a periodic summary line of pump activity.  This lets us tell, during
+# a stall, whether the issuer is alive-but-idle (counters frozen, last_step
+# stable) versus alive-and-issuing (counters advancing) versus dead (the
+# throttle heartbeat itself stops firing).
+_DISPATCH_STATE = {
+    "data_fetch_count": 0,
+    "policy_to_rollout_unicast_count": 0,
+    "rollout_to_rollout_broadcast_count": 0,
+    "policy_to_policy_unicast_count": 0,
+    "policy_to_policy_broadcast_count": 0,
+    "weight_resume_count": 0,
+    "build_mesh_count": 0,
+    "last_data_fetch_step": None,
+    "last_unicast_step": None,
+    "last_broadcast_step": None,
+    "last_dispatch_ts": None,
+}
+
+
+def record_dispatch(kind, step=None):
+    count_key = f"{kind}_count"
+    if count_key in _DISPATCH_STATE:
+        _DISPATCH_STATE[count_key] += 1
+    _DISPATCH_STATE["last_dispatch_ts"] = time.time()
+    if step is not None:
+        if kind == "data_fetch":
+            _DISPATCH_STATE["last_data_fetch_step"] = step
+        elif kind == "policy_to_rollout_unicast":
+            _DISPATCH_STATE["last_unicast_step"] = step
+        elif kind == "rollout_to_rollout_broadcast":
+            _DISPATCH_STATE["last_broadcast_step"] = step
+
+
+def snapshot_dispatch_state():
+    return dict(_DISPATCH_STATE)
 
 
 class CommandType(StrEnum):
@@ -112,6 +157,7 @@ class WeightResumeCommand(Command):
         )
         cmd = cls(replica.name)
         redis_handler.publish_command(cmd.pack(), replica.name)
+        record_dispatch("weight_resume")
         # initial weight step
         replica.weights_loaded_in_view_of_command = True
 
@@ -143,6 +189,7 @@ class BuildMeshCommand(Command):
         cmd = cls(replicas_to_rank)
         for replica in replicas:
             redis_handler.publish_command(cmd.pack(), replica.name)
+            record_dispatch("build_mesh")
 
     @classmethod
     def from_dict(cls, dict_v: Dict):
@@ -188,6 +235,7 @@ class PolicyToPolicyBroadcastCommand(Command):
         )
         for replica in dst_replicas:
             redis_handler.publish_command(cmd.pack(), replica.name)
+            record_dispatch("policy_to_policy_broadcast")
             replica.weights_loaded_in_view_of_command = True
 
     @classmethod
@@ -229,6 +277,7 @@ class PolicyToPolicyUnicastCommand(Command):
         cmd = cls(src_replica.name, dst_replica.name, total_steps)
         redis_handler.publish_command(cmd.pack(), src_replica.name)
         redis_handler.publish_command(cmd.pack(), dst_replica.name)
+        record_dispatch("policy_to_policy_unicast")
         dst_replica.weights_loaded_in_view_of_command = True
 
     @classmethod
@@ -302,6 +351,7 @@ class PolicyToRolloutUnicastCommand(Command):
         )
         redis_handler.publish_command(cmd.pack(), src_replica.name)
         redis_handler.publish_command(cmd.pack(), dst_replica.name)
+        record_dispatch("policy_to_rollout_unicast", step=weight_step)
         dst_replica.weights_loaded_in_view_of_command = True
 
         if cls._do_weight_sync_check_flag:
@@ -367,6 +417,7 @@ class RolloutToRolloutBroadcastCommand(Command):
             if not replica.in_mesh:
                 continue
             redis_handler.publish_command(cmd.pack(), replica.name)
+            record_dispatch("rollout_to_rollout_broadcast", step=weight_step)
             replica.weights_loaded_in_view_of_command = True
 
     def replica_should_stop(self):
@@ -468,6 +519,7 @@ class DataFetchCommand(Command):
             replica.sub_profiler_config.with_modules,
         )
         redis_handler.publish_command(cmd.pack(), replica.name)
+        record_dispatch("data_fetch", step=global_step)
 
     def replica_should_stop(self):
         if self.global_step is not None and self.total_steps is not None:
