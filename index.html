@@ -1,0 +1,525 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Welcome to cosmos-rl’s documentation! &mdash; cosmos-rl 0.1 documentation</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=2709fde1"></script>
+      <script src="_static/doctools.js?v=fd6eb6e6"></script>
+      <script src="_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Installation" href="quickstart/installation.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="#" class="icon icon-home">
+            cosmos-rl
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Quick Start</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="quickstart/installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart/single_node_example.html">Single node example</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart/configuration.html">Configuration</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart/dataflow.html">Dataset &amp; Process</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart/customization.html">Customization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart/hf_models_support.html">Hugging Face Model Support</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart/load_balanced_batching.html">Load-Balanced Dynamic Batching</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Rollout</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="rollout/vllm.html">vLLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="rollout/trtllm.html">[Experimental] TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Multi nodes training</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="multinodes/overview.html">Multi-node example</a></li>
+<li class="toctree-l1"><a class="reference internal" href="multinodes/dgxc_lepton.html">DGXC-Lepton Job</a></li>
+<li class="toctree-l1"><a class="reference internal" href="multinodes/slurm.html">Slurm Job</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Elastic &amp; Fault Tolerance</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="elastic/overview.html">Elastic Scaling and Fault Tolerance</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Async RL</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="async/overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="async/overview.html#key-features">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="async/overview.html#architecture">Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="async/overview.html#putting-it-all-together">Putting It All Together</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Parallelism</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="parallelism/overview.html">Parallelism</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Quantization</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="quantization/fp8.html">FP8 Quantization</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Distillation</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="distillation/on_policy_distillation.html">On-Policy Distillation</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Profiler</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="profiler/overview.html">Profiler</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">World Foundational Models</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="wfm/overview.html">Overview</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Vision-Language-Action Models</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="vla/overview.html">Overview</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="#">cosmos-rl</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="#" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Welcome to cosmos-rl’s documentation!</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="_sources/index.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="welcome-to-cosmos-rls-documentation">
+<h1>Welcome to cosmos-rl’s documentation!<a class="headerlink" href="#welcome-to-cosmos-rls-documentation" title="Link to this heading"></a></h1>
+<p>cosmos-rl is fully compatible with PyTorch and is designed for the future of distributed training.</p>
+<section id="main-features">
+<h2>Main Features<a class="headerlink" href="#main-features" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><dl class="simple">
+<dt><strong>Natively Designed for Physical AI</strong></dt><dd><ul>
+<li><p>Cosmos-RL supports training serveral physical AI paradigms, e.g., LLM/VLM, world foundational models, VLA, etc.</p></li>
+<li><dl class="simple">
+<dt><strong>Multi-training Algorithms</strong></dt><dd><ul>
+<li><p>Supports state-of-the-art LLM RL algorithms (e.g., GRPO, DAPO, etc.), RL algorithms for world foundational models (e.g., FlowGRPO, DDRL, DiffusionNFT, etc.), and VLA-specific algorithms.</p></li>
+<li><p>Well-architected design ensures high extensibility, requiring only minimal configuration to implement custom training algorithms.</p></li>
+</ul>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt><strong>Diversified Model Support</strong></dt><dd><ul>
+<li><dl class="simple">
+<dt>For LLM/VLM:</dt><dd><ul>
+<li><p>Natively supports LLaMA/Qwen/Qwen-VL/Qwen3-MoE series models.</p></li>
+<li><p>Compatible with all Huggingface LLMs.</p></li>
+</ul>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>For world foundational models:</dt><dd><ul>
+<li><p>Natively supports SD3/Cosmos-Predict2.5/SANA.</p></li>
+<li><p>Compatible with mainstream Huggingface world foundational models based on diffusers.</p></li>
+</ul>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt>For VLA (Vision-Language-Action):</dt><dd><ul>
+<li><p>Natively supports OpenVLA, OpenVLA-OFT, and PI0.5 series models.</p></li>
+<li><p>Integrated with LIBERO and BEHAVIOR-1K simulators.</p></li>
+</ul>
+</dd>
+</dl>
+</li>
+<li><p>Easily extensible to other model architectures by customizing interface.</p></li>
+</ul>
+</dd>
+</dl>
+</li>
+</ul>
+</dd>
+</dl>
+</li>
+<li><p><strong>6D Parallelism</strong>: Sequence, Tensor, Context, Pipeline, FSDP, DDP.</p></li>
+<li><p><strong>Elastic &amp; Fault Tolerance</strong>: A set of techniques to improve the robustness of distributed training.</p></li>
+<li><dl class="simple">
+<dt><strong>Async RL</strong></dt><dd><ul>
+<li><dl class="simple">
+<dt><strong>Flexible</strong></dt><dd><ul>
+<li><p><strong>Rollout</strong> and <strong>Policy</strong> are decoupled into independent processes/GPUs.</p></li>
+<li><p>No colocation of <strong>Rollout</strong> and <strong>Policy</strong> is required.</p></li>
+<li><p>Number of <strong>Rollout/Policy</strong> instances can be scaled independently.</p></li>
+</ul>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt><strong>Fast</strong></dt><dd><ul>
+<li><p><em>IB/NVLink</em> are used for high-speed weight synchronization.</p></li>
+<li><p><strong>Policy</strong> training and <strong>Rollout</strong> weight synchronization are <strong>PARALLELIZED</strong>.</p></li>
+</ul>
+</dd>
+</dl>
+</li>
+<li><dl class="simple">
+<dt><strong>Robust</strong></dt><dd><ul>
+<li><p>Support <a class="reference external" href="https://arxiv.org/pdf/2505.24034">AIPO</a> for stable off-policy training.</p></li>
+<li><p>Async/Sync strategy can be selected upon to user’s choice.</p></li>
+</ul>
+</dd>
+</dl>
+</li>
+</ul>
+</dd>
+</dl>
+</li>
+</ul>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>6D Parallelism is fully supported by Policy Model.
+For Rollout Model, only Tensor Parallelism and Pipeline Parallelism are supported.</p>
+</div>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">Quick Start</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="quickstart/installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/installation.html#requirements">Requirements</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/installation.html#setup">Setup</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="quickstart/installation.html#option-1-build-docker-image-from-source">🐳 Option 1: Build docker image from source</a></li>
+<li class="toctree-l3"><a class="reference internal" href="quickstart/installation.html#option-2-run-in-your-own-environment">🔨 Option 2: Run in your own environment</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart/single_node_example.html">Single node example</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart/configuration.html">Configuration</a></li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart/dataflow.html">Dataset &amp; Process</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/dataflow.html#dataflow">Dataflow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/dataflow.html#pre-defined-datapacker">Pre-defined DataPacker</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="quickstart/dataflow.html#decoder-only-llm-packer">Decoder Only LLM Packer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="quickstart/dataflow.html#qwen2-5-vlm-packer">Qwen2.5-VLM Packer</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart/customization.html">Customization</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/customization.html#customized-dataset">Customized dataset</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="quickstart/customization.html#how-to-tell-the-launcher-to-use-your-customized-dataset">How to tell the launcher to use your customized dataset?</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/customization.html#customized-reward">Customized reward</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/customization.html#customized-data-packer">Customized Data Packer</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/customization.html#customized-model">Customized Model</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart/hf_models_support.html">Hugging Face Model Support</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/hf_models_support.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/hf_models_support.html#architecture-design">Architecture Design</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/hf_models_support.html#distributed-training-support">Distributed Training Support</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/hf_models_support.html#training-examples">Training Examples</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="quickstart/hf_models_support.html#sft">SFT</a></li>
+<li class="toctree-l3"><a class="reference internal" href="quickstart/hf_models_support.html#grpo">GRPO</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/hf_models_support.html#supported-models">Supported Models</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="quickstart/hf_models_support.html#llms">LLMs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="quickstart/hf_models_support.html#vlms">VLMs</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="quickstart/load_balanced_batching.html">Load-Balanced Dynamic Batching</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/load_balanced_batching.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/load_balanced_batching.html#key-features">Key Features</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/load_balanced_batching.html#how-it-works">How It Works</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/load_balanced_batching.html#batch-formation-strategy">Batch Formation Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/load_balanced_batching.html#configuration">Configuration</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/load_balanced_batching.html#configuration-parameters">Configuration Parameters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/load_balanced_batching.html#usage-example">Usage Example</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="quickstart/load_balanced_batching.html#example-with-sequence-packing">Example with Sequence Packing</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/load_balanced_batching.html#gradient-accumulation">Gradient Accumulation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/load_balanced_batching.html#infinite-loop-and-epoch-management">Infinite Loop and Epoch Management</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/load_balanced_batching.html#resume-support">Resume Support</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/load_balanced_batching.html#implementation-details">Implementation Details</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="quickstart/load_balanced_batching.html#shardediterabledataset">ShardedIterableDataset</a></li>
+<li class="toctree-l3"><a class="reference internal" href="quickstart/load_balanced_batching.html#loadbalanceddataset">LoadBalancedDataset</a></li>
+<li class="toctree-l3"><a class="reference internal" href="quickstart/load_balanced_batching.html#best-fit-algorithm">Best-Fit Algorithm</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/load_balanced_batching.html#advantages">Advantages</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/load_balanced_batching.html#limitations">Limitations</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/load_balanced_batching.html#best-practices">Best Practices</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="quickstart/load_balanced_batching.html#when-to-use-sequence-packing">When to Use Sequence Packing</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/load_balanced_batching.html#troubleshooting">Troubleshooting</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quickstart/load_balanced_batching.html#related-documentation">Related Documentation</a></li>
+</ul>
+</li>
+</ul>
+</div>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">Rollout</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="rollout/vllm.html">vLLM</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="rollout/vllm.html#enable-vllm">Enable vLLM</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="rollout/trtllm.html">[Experimental] TensorRT-LLM</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="rollout/trtllm.html#enable-tensorrt-llm">Enable TensorRT-LLM</a></li>
+</ul>
+</li>
+</ul>
+</div>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">Multi nodes training</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="multinodes/overview.html">Multi-node example</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="multinodes/overview.html#manual-deployment">Manual deployment</a></li>
+<li class="toctree-l2"><a class="reference internal" href="multinodes/overview.html#dgxc-lepton-job-example">DGXC-Lepton job example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="multinodes/overview.html#slurm-job-example">Slurm job example</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="multinodes/dgxc_lepton.html">DGXC-Lepton Job</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="multinodes/dgxc_lepton.html#example">Example</a></li>
+<li class="toctree-l2"><a class="reference internal" href="multinodes/dgxc_lepton.html#valid-resource-shapes">Valid Resource Shapes</a></li>
+<li class="toctree-l2"><a class="reference internal" href="multinodes/dgxc_lepton.html#cpu-instances">CPU Instances</a></li>
+<li class="toctree-l2"><a class="reference internal" href="multinodes/dgxc_lepton.html#gpu-instances">GPU Instances</a></li>
+<li class="toctree-l2"><a class="reference internal" href="multinodes/dgxc_lepton.html#option-reference-for-cosmos-rl-command">Option Reference for <cite>cosmos-rl</cite> command</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="multinodes/slurm.html">Slurm Job</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="multinodes/slurm.html#custom-launcher">Custom Launcher</a></li>
+<li class="toctree-l2"><a class="reference internal" href="multinodes/slurm.html#full-argument-list">Full Argument List</a></li>
+</ul>
+</li>
+</ul>
+</div>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">Elastic &amp; Fault Tolerance</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="elastic/overview.html">Elastic Scaling and Fault Tolerance</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="elastic/overview.html#elastic-scaling">Elastic Scaling</a></li>
+<li class="toctree-l2"><a class="reference internal" href="elastic/overview.html#demo-elastic-scaling-in-action">Demo: Elastic Scaling in Action</a></li>
+<li class="toctree-l2"><a class="reference internal" href="elastic/overview.html#fault-tolerance">Fault Tolerance</a></li>
+</ul>
+</li>
+</ul>
+</div>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">Async RL</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="async/overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="async/overview.html#key-features">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="async/overview.html#architecture">Architecture</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="async/overview.html#disaggregated-policy-rollout-workers">Disaggregated Policy &amp; Rollout Workers</a></li>
+<li class="toctree-l2"><a class="reference internal" href="async/overview.html#unblocking-weight-synchronization">Unblocking Weight Synchronization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="async/overview.html#high-performance-weight-transfer">High-Performance Weight Transfer</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="async/overview.html#putting-it-all-together">Putting It All Together</a></li>
+</ul>
+</div>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">Parallelism</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="parallelism/overview.html">Parallelism</a></li>
+</ul>
+</div>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">Quantization</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="quantization/fp8.html">FP8 Quantization</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="quantization/fp8.html#enable-fp8-quantization">Enable FP8 Quantization</a></li>
+</ul>
+</li>
+</ul>
+</div>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">Distillation</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="distillation/on_policy_distillation.html">On-Policy Distillation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="distillation/on_policy_distillation.html#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="distillation/on_policy_distillation.html#quick-start">Quick Start</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distillation/on_policy_distillation.html#example-commands">Example Commands</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="distillation/on_policy_distillation.html#deepmath-dataset-qwen3-8b">DeepMath Dataset (Qwen3-8B)</a></li>
+<li class="toctree-l4"><a class="reference internal" href="distillation/on_policy_distillation.html#countdown-dataset-qwen2-5-1-5b">Countdown Dataset (Qwen2.5-1.5B)</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="distillation/on_policy_distillation.html#configuration-file-structure">Configuration File Structure</a></li>
+<li class="toctree-l2"><a class="reference internal" href="distillation/on_policy_distillation.html#distillation-parameters">Distillation Parameters</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distillation/on_policy_distillation.html#core-configuration">Core Configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distillation/on_policy_distillation.html#parallelism-configuration">Parallelism Configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distillation/on_policy_distillation.html#advanced-options">Advanced Options</a><ul>
+<li class="toctree-l4"><a class="reference internal" href="distillation/on_policy_distillation.html#teacher-model-setting-configuration">Teacher Model Setting Configuration</a></li>
+<li class="toctree-l4"><a class="reference internal" href="distillation/on_policy_distillation.html#loss-sampling-algorithm-configuration">Loss &amp; Sampling Algorithm Configuration</a></li>
+<li class="toctree-l4"><a class="reference internal" href="distillation/on_policy_distillation.html#model-training-framework-configuration">Model Training Framework Configuration</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="distillation/on_policy_distillation.html#launching-on-slurm">Launching on SLURM</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distillation/on_policy_distillation.html#notes">Notes</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="distillation/on_policy_distillation.html#launching-on-lepton">Launching on Lepton</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="distillation/on_policy_distillation.html#reference-job">Reference Job</a></li>
+<li class="toctree-l3"><a class="reference internal" href="distillation/on_policy_distillation.html#steps-to-clone-and-customize">Steps to Clone and Customize</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="distillation/on_policy_distillation.html#see-also">See Also</a></li>
+</ul>
+</li>
+</ul>
+</div>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">Profiler</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="profiler/overview.html">Profiler</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="profiler/overview.html#prerequisites">Prerequisites</a></li>
+<li class="toctree-l2"><a class="reference internal" href="profiler/overview.html#step-by-step-workflow">Step-by-Step Workflow</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="profiler/overview.html#list-running-replicas">1) List running replicas</a></li>
+<li class="toctree-l3"><a class="reference internal" href="profiler/overview.html#pick-the-target-policy-replica">2) Pick the target policy replica</a></li>
+<li class="toctree-l3"><a class="reference internal" href="profiler/overview.html#enable-profiling-for-that-replica">3) Enable profiling for that replica</a></li>
+<li class="toctree-l3"><a class="reference internal" href="profiler/overview.html#confirm-profiler-logs-on-the-policy-replica">4) Confirm profiler logs on the policy replica</a></li>
+<li class="toctree-l3"><a class="reference internal" href="profiler/overview.html#open-the-trace-in-chrome-trace-viewer">5) Open the trace in Chrome trace viewer</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="profiler/overview.html#quick-troubleshooting">Quick Troubleshooting</a></li>
+</ul>
+</li>
+</ul>
+</div>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">World Foundational Models</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="wfm/overview.html">Overview</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="wfm/overview.html#supported-models">Supported Models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="wfm/overview.html#configurations">Configurations</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="wfm/overview.html#sft">SFT</a></li>
+<li class="toctree-l3"><a class="reference internal" href="wfm/overview.html#rl">RL</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="wfm/overview.html#datasets">Datasets</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="wfm/overview.html#id1">SFT</a></li>
+<li class="toctree-l3"><a class="reference internal" href="wfm/overview.html#id2">RL</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="wfm/overview.html#launch-training">Launch Training</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="wfm/overview.html#id3">SFT</a></li>
+<li class="toctree-l3"><a class="reference internal" href="wfm/overview.html#id4">RL</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="wfm/overview.html#use-trained-models">Use Trained Models</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="wfm/overview.html#lora">LoRA</a></li>
+<li class="toctree-l3"><a class="reference internal" href="wfm/overview.html#full-pipeline">Full Pipeline</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="wfm/overview.html#add-new-models">Add New Models</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="wfm/overview.html#id5">SFT</a></li>
+<li class="toctree-l3"><a class="reference internal" href="wfm/overview.html#id6">RL</a></li>
+<li class="toctree-l3"><a class="reference internal" href="wfm/overview.html#id7">Configuration</a></li>
+<li class="toctree-l3"><a class="reference internal" href="wfm/overview.html#validation-checklist">Validation Checklist</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="wfm/overview.html#rl-deprecated">RL (deprecated)</a></li>
+</ul>
+</li>
+</ul>
+</div>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">Vision-Language-Action Models</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="vla/overview.html">Overview</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="vla/overview.html#vla-models">VLA Models</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vla/overview.html#openvla-series">OpenVLA Series</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vla/overview.html#pi-series-pi0-5">PI Series (PI0.5)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="vla/overview.html#simulators">Simulators</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vla/overview.html#libero-mujoco-based">LIBERO (MuJoCo-based)</a></li>
+<li class="toctree-l3"><a class="reference internal" href="vla/overview.html#behavior-1k-isaacsim-based">BEHAVIOR-1K (IsaacSim-based)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="vla/overview.html#reinforcement-learning-algorithms">Reinforcement Learning Algorithms</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="vla/overview.html#grpo-group-relative-policy-optimization">GRPO (Group Relative Policy Optimization)</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="vla/overview.html#quick-start">Quick Start</a></li>
+<li class="toctree-l2"><a class="reference internal" href="vla/overview.html#references">References</a></li>
+</ul>
+</li>
+</ul>
+</div>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="quickstart/installation.html" class="btn btn-neutral float-right" title="Installation" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2025, NVIDIA.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

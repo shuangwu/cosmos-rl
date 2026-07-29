@@ -1,0 +1,263 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="../">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hugging Face Model Support &mdash; cosmos-rl 0.1 documentation</title>
+      <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="../_static/css/theme.css?v=9edc463e" />
+
+  
+      <script src="../_static/jquery.js?v=5d32c60e"></script>
+      <script src="../_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="../_static/documentation_options.js?v=2709fde1"></script>
+      <script src="../_static/doctools.js?v=fd6eb6e6"></script>
+      <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Load-Balanced Dynamic Batching" href="load_balanced_batching.html" />
+    <link rel="prev" title="Customization" href="customization.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="../index.html" class="icon icon-home">
+            cosmos-rl
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="../search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">Quick Start</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="single_node_example.html">Single node example</a></li>
+<li class="toctree-l1"><a class="reference internal" href="configuration.html">Configuration</a></li>
+<li class="toctree-l1"><a class="reference internal" href="dataflow.html">Dataset &amp; Process</a></li>
+<li class="toctree-l1"><a class="reference internal" href="customization.html">Customization</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Hugging Face Model Support</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#overview">Overview</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#architecture-design">Architecture Design</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#distributed-training-support">Distributed Training Support</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#training-examples">Training Examples</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#sft">SFT</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#grpo">GRPO</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="#supported-models">Supported Models</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#llms">LLMs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#vlms">VLMs</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="load_balanced_batching.html">Load-Balanced Dynamic Batching</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Rollout</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../rollout/vllm.html">vLLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../rollout/trtllm.html">[Experimental] TensorRT-LLM</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Multi nodes training</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../multinodes/overview.html">Multi-node example</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../multinodes/dgxc_lepton.html">DGXC-Lepton Job</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../multinodes/slurm.html">Slurm Job</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Elastic &amp; Fault Tolerance</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../elastic/overview.html">Elastic Scaling and Fault Tolerance</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Async RL</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../async/overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../async/overview.html#key-features">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../async/overview.html#architecture">Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../async/overview.html#putting-it-all-together">Putting It All Together</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Parallelism</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../parallelism/overview.html">Parallelism</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Quantization</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../quantization/fp8.html">FP8 Quantization</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Distillation</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../distillation/on_policy_distillation.html">On-Policy Distillation</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Profiler</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../profiler/overview.html">Profiler</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">World Foundational Models</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../wfm/overview.html">Overview</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">Vision-Language-Action Models</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../vla/overview.html">Overview</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../index.html">cosmos-rl</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="../index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Hugging Face Model Support</li>
+      <li class="wy-breadcrumbs-aside">
+            <a href="../_sources/quickstart/hf_models_support.rst.txt" rel="nofollow"> View page source</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="hugging-face-model-support">
+<h1>Hugging Face Model Support<a class="headerlink" href="#hugging-face-model-support" title="Link to this heading"></a></h1>
+<section id="overview">
+<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading"></a></h2>
+<p>Cosmos-RL provides comprehensive support for Hugging Face models through its generic <code class="docutils literal notranslate"><span class="pre">HFModel</span></code> wrapper. This design enables seamless integration of any LLMs or VLMs compatible with HF Transformers into the training and inference pipeline.</p>
+</section>
+<section id="architecture-design">
+<h2>Architecture Design<a class="headerlink" href="#architecture-design" title="Link to this heading"></a></h2>
+<p>The <code class="docutils literal notranslate"><span class="pre">HFModel</span></code> class, implemented in <code class="docutils literal notranslate"><span class="pre">cosmos_rl/policy/model/hf_models/__init__.py</span></code>, serves as a universal adapter for Hugging Face models. Key design principles include:</p>
+<dl class="simple">
+<dt><strong>Universal Compatibility</strong></dt><dd><p>The wrapper supports any LLM or VLM architecture available through Hugging Face’s model ecosystem.</p>
+</dd>
+<dt><strong>Automatic Fallback Mechanism</strong></dt><dd><p>When a model lacks custom implementation in the <code class="docutils literal notranslate"><span class="pre">cosmos_rl/policy/model</span></code> directory, the system automatically defaults to the HF Model wrapper, ensuring broad compatibility without requiring custom code.</p>
+</dd>
+<dt><strong>Seamless Integration</strong></dt><dd><ul class="simple">
+<li><p>Model configuration loading via <code class="docutils literal notranslate"><span class="pre">AutoConfig.from_pretrained</span></code></p></li>
+<li><p>Weight loading through <code class="docutils literal notranslate"><span class="pre">model_class.from_pretrained</span></code> (<code class="docutils literal notranslate"><span class="pre">model_class</span></code> is defined in “architectures” of config.json)</p></li>
+</ul>
+</dd>
+<dt><strong>Distributed Training Ready</strong></dt><dd><p>The wrapper is optimized for distributed training strategies, particularly FSDP (Fully Sharded Data Parallel), with built-in support for:
+- Weight synchronization
+- Rotary embedding handling
+- Parallelism compatibility checks</p>
+</dd>
+<dt><strong>Extensibility</strong></dt><dd><p>Users can rapidly experiment with new or custom Hugging Face models without waiting for explicit cosmos-rl support, making the framework future-proof and adaptable to the evolving AI model landscape.</p>
+</dd>
+</dl>
+</section>
+<section id="distributed-training-support">
+<h2>Distributed Training Support<a class="headerlink" href="#distributed-training-support" title="Link to this heading"></a></h2>
+<ul class="simple">
+<li><p>Fully Sharded Data Parallel (FSDP)</p></li>
+<li><p>Tensor Parallelism (TP)</p></li>
+</ul>
+</section>
+<section id="training-examples">
+<h2>Training Examples<a class="headerlink" href="#training-examples" title="Link to this heading"></a></h2>
+<section id="sft">
+<h3>SFT<a class="headerlink" href="#sft" title="Link to this heading"></a></h3>
+<p>Note:</p>
+<ol class="arabic simple">
+<li><p>For LLMs like Mistral that require special handling to avoid role alternation errors, use the provided <code class="docutils literal notranslate"><span class="pre">dummy_sft.py</span></code> script.</p></li>
+<li><p>For VLMs, use the provided <code class="docutils literal notranslate"><span class="pre">hf_vlm_sft.py</span></code> script.</p></li>
+</ol>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># LLM SFT</span>
+cosmos-rl<span class="w"> </span>--config<span class="w"> </span>configs/mistral/mistral-7b-fsdp4-sft.toml<span class="w"> </span>./tools/dataset/dummy_sft.py
+
+<span class="c1"># VLM SFT</span>
+cosmos-rl<span class="w"> </span>--config<span class="w"> </span>configs/gemma/gemma3-12b-vlm-fsdp4-sft.toml<span class="w"> </span>./tools/dataset/hf_vlm_sft.py
+</pre></div>
+</div>
+</section>
+<section id="grpo">
+<h3>GRPO<a class="headerlink" href="#grpo" title="Link to this heading"></a></h3>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># LLM GRPO</span>
+cosmos-rl<span class="w"> </span>--config<span class="w"> </span>configs/phi/phi4-14b-p-fsdp4-r-tp2-grpo.toml<span class="w"> </span>./tools/dataset/gsm8k_grpo.py
+</pre></div>
+</div>
+</section>
+</section>
+<section id="supported-models">
+<h2>Supported Models<a class="headerlink" href="#supported-models" title="Link to this heading"></a></h2>
+<p>The following models have been thoroughly tested and validated:</p>
+<section id="llms">
+<h3>LLMs<a class="headerlink" href="#llms" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>Mistral</strong></p></li>
+<li><p><strong>Gemma</strong></p></li>
+<li><p><strong>Phi</strong></p></li>
+<li><p><strong>GPT-OSS</strong></p></li>
+</ul>
+</section>
+<section id="vlms">
+<h3>VLMs<a class="headerlink" href="#vlms" title="Link to this heading"></a></h3>
+<ul class="simple">
+<li><p><strong>Gemma VLM</strong></p></li>
+<li><p><strong>Llama VLM</strong></p></li>
+<li><p><strong>LLava</strong></p></li>
+</ul>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>While models above have been extensively tested, other Hugging Face models should also be compatible. If you encounter issues with untested models, please report them by opening an issue in our repository.</p>
+</div>
+<div class="admonition tip">
+<p class="admonition-title">Tip</p>
+<p>The generic HF Model wrapper enables support for most Hugging Face models without additional configuration. For optimal performance, consider using models that have been specifically tested and optimized.</p>
+</div>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="customization.html" class="btn btn-neutral float-left" title="Customization" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="load_balanced_batching.html" class="btn btn-neutral float-right" title="Load-Balanced Dynamic Batching" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2025, NVIDIA.</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
