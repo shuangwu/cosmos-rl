@@ -47,6 +47,17 @@ from cosmos_rl.policy.trainer.optm import build_lr_schedulers
 from functools import partial
 
 
+_P2P_SYNC_BUCKET_SIZE_BYTES = int(
+    os.getenv("COSMOS_P2P_SYNC_BUCKET_SIZE_BYTES", str(256 * 1024 * 1024))
+)
+_p2p_sync_pack_tensors_env = os.getenv("COSMOS_P2P_SYNC_PACK_TENSORS")
+_P2P_SYNC_PACK_TENSORS = (
+    None
+    if _p2p_sync_pack_tensors_env is None
+    else _p2p_sync_pack_tensors_env.lower() in {"1", "true", "yes", "on"}
+)
+
+
 class LLMTrainer(Trainer):
     def __init__(
         self,
@@ -330,6 +341,94 @@ class LLMTrainer(Trainer):
             len_params (int): The number of parameters synced.
         """
         len_params = 0
+        active_hook = send_hook if is_send else recv_hook
+        batch_hook = (
+            getattr(active_hook, "batch", None)
+            if _P2P_SYNC_BUCKET_SIZE_BYTES > 0
+            else None
+        )
+        config_pack_tensors = getattr(
+            getattr(getattr(self, "config", None), "train", None),
+            "p2p_sync_pack_tensors",
+            False,
+        )
+        pack_tensors_enabled = (
+            config_pack_tensors
+            if _P2P_SYNC_PACK_TENSORS is None
+            else _P2P_SYNC_PACK_TENSORS
+        )
+        pack_tensors = pack_tensors_enabled and getattr(
+            active_hook, "supports_packing", False
+        )
+        pending_transfers = []
+        pending_bytes = 0
+        unpacked_on_cuda = False
+
+        if _P2P_SYNC_BUCKET_SIZE_BYTES < 0:
+            raise ValueError("P2P sync bucket size cannot be negative")
+
+        def flush_pending_transfers():
+            nonlocal pending_transfers, pending_bytes, unpacked_on_cuda
+            if not pending_transfers:
+                return
+            tensors = [tensor for tensor, _ in pending_transfers]
+            if pack_tensors and len(tensors) > 1:
+                packed_buffer = getattr(self, "_p2p_sync_packed_buffer", None)
+                if (
+                    packed_buffer is None
+                    or packed_buffer.device != tensors[0].device
+                    or packed_buffer.numel() < pending_bytes
+                ):
+                    packed_buffer = torch.empty(
+                        pending_bytes,
+                        dtype=torch.uint8,
+                        device=tensors[0].device,
+                    )
+                    self._p2p_sync_packed_buffer = packed_buffer
+                payload = packed_buffer[:pending_bytes]
+                if is_send:
+                    offset = 0
+                    for tensor in tensors:
+                        tensor_bytes = tensor.view(-1).view(torch.uint8)
+                        end = offset + tensor_bytes.numel()
+                        payload[offset:end].copy_(tensor_bytes)
+                        offset = end
+                active_hook(payload)
+                if not is_send:
+                    offset = 0
+                    for tensor in tensors:
+                        tensor_bytes = tensor.view(-1).view(torch.uint8)
+                        end = offset + tensor_bytes.numel()
+                        tensor_bytes.copy_(payload[offset:end])
+                        offset = end
+                    unpacked_on_cuda = tensors[0].is_cuda
+            else:
+                batch_hook(tensors)
+            if not is_send:
+                for tensor, receive_callback in pending_transfers:
+                    receive_callback(tensor)
+            pending_transfers = []
+            pending_bytes = 0
+
+        def transfer_tensor(local_view, receive_callback=None):
+            nonlocal len_params, pending_bytes
+            if batch_hook is None:
+                active_hook(local_view)
+                if not is_send:
+                    receive_callback(local_view)
+            else:
+                nbytes = local_view.numel() * local_view.element_size()
+                if (
+                    pending_transfers
+                    and pending_bytes + nbytes > _P2P_SYNC_BUCKET_SIZE_BYTES
+                ):
+                    flush_pending_transfers()
+                pending_transfers.append((local_view, receive_callback))
+                pending_bytes += nbytes
+                if pending_bytes >= _P2P_SYNC_BUCKET_SIZE_BYTES:
+                    flush_pending_transfers()
+            len_params += 1
+
         if self.parallel_dims.pp_enabled:
             state_dict = {}
             for model_part in self.model_parts:
@@ -362,19 +461,20 @@ class LLMTrainer(Trainer):
                 local_view = wrap_to_cuda_tensor(
                     self.device, dest_name, obj, in_place=obj.is_cuda
                 )
-                if is_send:
-                    send_hook(local_view)
-                else:
-                    recv_hook(local_view)
-                    if isinstance(obj, torch.distributed.tensor.DTensor):
-                        to_write = obj.to_local()
+
+                def receive_model_state(received, original=obj):
+                    assert not is_send
+                    if isinstance(original, torch.distributed.tensor.DTensor):
+                        to_write = original.to_local()
                     else:
-                        to_write = obj
+                        to_write = original
 
                     # Copy again for offloaded tensor since it is not inplace received
                     if not to_write.is_cuda:
-                        to_write.copy_(local_view)
-                len_params += 1
+                        to_write.copy_(received)
+
+                transfer_tensor(local_view, receive_model_state)
+        flush_pending_transfers()
 
         # 2. Sync optimizer states
         optimizer_state = self.optimizers.state_dict()
@@ -384,19 +484,18 @@ class LLMTrainer(Trainer):
             if local_view.data_ptr() is None:
                 # skip the optimizer state if the data pointer is None
                 continue
-            if is_send:
-                # nccl send
-                send_hook(local_view)
-            else:
-                # nccl recv
-                recv_hook(local_view)
-                optimizer_state[dest_name] = extract_from_cuda_tensor(
+
+            def receive_optimizer_state(received, name=dest_name, original=obj):
+                assert not is_send
+                optimizer_state[name] = extract_from_cuda_tensor(
                     self.device,
-                    dest_name,
-                    obj,
-                    local_view,
+                    name,
+                    original,
+                    received,
                 )
-            len_params += 1
+
+            transfer_tensor(local_view, receive_optimizer_state)
+        flush_pending_transfers()
 
         if not is_send:
             self.optimizers.load_state_dict(optimizer_state)
@@ -407,19 +506,18 @@ class LLMTrainer(Trainer):
             for dest_name in sorted(lr_sheduler_state.keys()):
                 obj = lr_sheduler_state[dest_name]
                 local_view = wrap_to_cuda_tensor(self.device, dest_name, obj)
-                if is_send:
-                    # nccl send
-                    send_hook(local_view)
-                else:
-                    # nccl recv
-                    recv_hook(local_view)
-                    lr_sheduler_state[dest_name] = extract_from_cuda_tensor(
+
+                def receive_scheduler_state(received, name=dest_name, original=obj):
+                    assert not is_send
+                    lr_sheduler_state[name] = extract_from_cuda_tensor(
                         self.device,
-                        dest_name,
-                        obj,
-                        local_view,
+                        name,
+                        original,
+                        received,
                     )
-                len_params += 1
+
+                transfer_tensor(local_view, receive_scheduler_state)
+            flush_pending_transfers()
             if not is_send:
                 self.lr_schedulers.load_state_dict(lr_sheduler_state)
 
@@ -428,18 +526,19 @@ class LLMTrainer(Trainer):
         for dest_name in sorted(rng_state.keys()):
             obj = rng_state[dest_name]
             local_view = wrap_to_cuda_tensor(self.device, dest_name, obj)
-            if is_send:
-                # nccl send
-                send_hook(local_view)
-            else:
-                # nccl recv
-                recv_hook(local_view)
-                rng_state[dest_name] = extract_from_cuda_tensor(
-                    self.device, dest_name, obj, local_view
+
+            def receive_rng_state(received, name=dest_name, original=obj):
+                assert not is_send
+                rng_state[name] = extract_from_cuda_tensor(
+                    self.device, name, original, received
                 )
-            len_params += 1
+
+            transfer_tensor(local_view, receive_rng_state)
+        flush_pending_transfers()
         if not is_send:
             self.ckpt_manager.set_rng_state(rng_state)
+            if unpacked_on_cuda:
+                torch.cuda.synchronize(self.device)
         return len_params
 
     def export_safetensors(

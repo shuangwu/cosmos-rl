@@ -77,6 +77,33 @@ COSMOS_P2R_STREAM_DRAIN_TIMEOUT_S = float(
 )
 
 
+class _P2PNcclHook:
+    """Keep custom trainers callable-compatible while exposing batching."""
+
+    def __init__(self, single_hook: Callable, batch_hook: Optional[Callable]):
+        self._single_hook = single_hook
+        self._batch_hook = batch_hook
+        self.supports_packing = batch_hook is not None
+
+    def __call__(self, tensor: torch.Tensor):
+        return self._single_hook(tensor)
+
+    def batch(self, tensors):
+        if self._batch_hook is not None:
+            return self._batch_hook(tensors)
+        for tensor in tensors:
+            self._single_hook(tensor)
+
+
+def _bind_p2p_nccl_hook(
+    single_hook: Callable, batch_hook: Optional[Callable], **kwargs
+):
+    return _P2PNcclHook(
+        partial(single_hook, **kwargs),
+        partial(batch_hook, **kwargs) if batch_hook is not None else None,
+    )
+
+
 class RLPolicyWorker(PolicyWorkerBase):
     """
     RL Policy Worker. This worker is responsible for the training of the RL.
@@ -368,8 +395,10 @@ class RLPolicyWorker(PolicyWorkerBase):
             return True
         st = time.time()
         # TODO(zjx): there need failure tolerance for nccl send and recv, so get nccl param from command
-        send_recv_hook = partial(
-            self.inter_policy_nccl.broadcast, src_replica=command.src_replica_name
+        send_recv_hook = _bind_p2p_nccl_hook(
+            self.inter_policy_nccl.broadcast,
+            getattr(self.inter_policy_nccl, "broadcast_batch", None),
+            src_replica=command.src_replica_name,
         )
         len_params = self.sync_all_states(
             is_send=send,
@@ -394,11 +423,15 @@ class RLPolicyWorker(PolicyWorkerBase):
             return False
         st = time.time()
         # TODO(zjx): there need failure tolerance for nccl send and recv, so get nccl param from command
-        send_hook = partial(
-            self.inter_policy_nccl.send, dst_replica=command.dst_replica_name
+        send_hook = _bind_p2p_nccl_hook(
+            self.inter_policy_nccl.send,
+            getattr(self.inter_policy_nccl, "send_batch", None),
+            dst_replica=command.dst_replica_name,
         )
-        recv_hook = partial(
-            self.inter_policy_nccl.recv, src_replica=command.src_replica_name
+        recv_hook = _bind_p2p_nccl_hook(
+            self.inter_policy_nccl.recv,
+            getattr(self.inter_policy_nccl, "recv_batch", None),
+            src_replica=command.src_replica_name,
         )
         len_params = self.sync_all_states(
             is_send=send,

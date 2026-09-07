@@ -913,6 +913,13 @@ class TrainingConfig(BaseModel):
         default=1,
         description="The interval of train step for synchronizing weights between replicas.",
     )
+    p2p_sync_pack_tensors: bool = Field(
+        default=False,
+        description=(
+            "Pack small tensors into byte-bounded buffers for policy-to-policy "
+            "initialization and dynamic-scale state synchronization."
+        ),
+    )
     coalesce_weight_sync: bool = Field(
         default=False,
         description="If True, the controller coalesces (drops) redundant P2R+R2R "

@@ -20,6 +20,7 @@ fsdp_offload = false
 fsdp_reshard_after_forward = "default"
 train_batch_per_replica = 8
 sync_weight_interval = 1
+p2p_sync_pack_tensors = true
 
 [rollout]
 gpu_memory_utilization = 0.7

@@ -704,6 +704,17 @@ class HighAvailabilitylNccl:
             self.api_client.post_clear_nccl_comm_store(unique_pair_name)
 
     def __do_nccl_op_with_retry(self, func: Callable, timeout_ms: int, **kwargs):
+        self.__do_nccl_ops_with_retry(func, timeout_ms, (kwargs,))
+
+    def __do_nccl_ops_with_retry(
+        self,
+        func: Callable,
+        timeout_ms: int,
+        operations: Iterable[dict],
+    ):
+        operations = tuple(operations)
+        if not operations:
+            return
         if self.is_single_peer.is_set():
             # single peer, no need to do nccl op
             return
@@ -724,11 +735,12 @@ class HighAvailabilitylNccl:
                     nccl_timeout_watchdog(wait_stream=True, timeout_ms=timeout_ms),
                     self.build_mesh_lock,
                 ):
-                    func(
-                        comm_idx=self.comm_idx,
-                        timeout_ms=timeout_ms,
-                        **kwargs,
-                    )
+                    for kwargs in operations:
+                        func(
+                            comm_idx=self.comm_idx,
+                            timeout_ms=timeout_ms,
+                            **kwargs,
+                        )
 
                 return
             except Exception as e:
@@ -746,8 +758,9 @@ class HighAvailabilitylNccl:
                         self.__log_prefix(),
                     )
                 logger.error(
-                    f"{self.__log_prefix()} recovering nccl op '{func.__name__}' "
-                    f"with kwargs {kwargs} after attempt {attempt}/{self.max_retry}: {e}"
+                    f"{self.__log_prefix()} recovering batch of {len(operations)} "
+                    f"nccl op(s) '{func.__name__}' after attempt "
+                    f"{attempt}/{self.max_retry}: {e}"
                 )
         raise RuntimeError(
             f"{self.__log_prefix()} nccl op '{func.__name__}' failed after "
@@ -825,12 +838,22 @@ class HighAvailabilitylNccl:
         return self.replica_name_to_rank[replica_name]
 
     def broadcast(self, tensor: torch.Tensor, src_replica: str, timeout_ms: int = None):
+        self.broadcast_batch((tensor,), src_replica, timeout_ms)
+
+    def broadcast_batch(
+        self,
+        tensors: Iterable[torch.Tensor],
+        src_replica: str,
+        timeout_ms: int = None,
+    ):
+        tensors = tuple(tensors)
+        if not tensors:
+            return
         src_rank = self.get_replica_rank(src_replica)
-        self.__do_nccl_op_with_retry(
+        self.__do_nccl_ops_with_retry(
             func=nccl_broadcast,
-            tensor=tensor,
-            rank=src_rank,
             timeout_ms=timeout_ms,
+            operations=({"tensor": tensor, "rank": src_rank} for tensor in tensors),
         )
 
     def allreduce(
@@ -849,21 +872,41 @@ class HighAvailabilitylNccl:
         )
 
     def send(self, tensor: torch.Tensor, dst_replica: str, timeout_ms: int = None):
+        self.send_batch((tensor,), dst_replica, timeout_ms)
+
+    def send_batch(
+        self,
+        tensors: Iterable[torch.Tensor],
+        dst_replica: str,
+        timeout_ms: int = None,
+    ):
+        tensors = tuple(tensors)
+        if not tensors:
+            return
         dst_rank = self.get_replica_rank(dst_replica)
-        self.__do_nccl_op_with_retry(
+        self.__do_nccl_ops_with_retry(
             func=nccl_send,
-            tensor=tensor,
-            peer=dst_rank,
             timeout_ms=timeout_ms,
+            operations=({"tensor": tensor, "peer": dst_rank} for tensor in tensors),
         )
 
     def recv(self, tensor: torch.Tensor, src_replica: str, timeout_ms: int = None):
+        self.recv_batch((tensor,), src_replica, timeout_ms)
+
+    def recv_batch(
+        self,
+        tensors: Iterable[torch.Tensor],
+        src_replica: str,
+        timeout_ms: int = None,
+    ):
+        tensors = tuple(tensors)
+        if not tensors:
+            return
         src_rank = self.get_replica_rank(src_replica)
-        self.__do_nccl_op_with_retry(
+        self.__do_nccl_ops_with_retry(
             func=nccl_recv,
-            tensor=tensor,
-            peer=src_rank,
             timeout_ms=timeout_ms,
+            operations=({"tensor": tensor, "peer": src_rank} for tensor in tensors),
         )
 
 

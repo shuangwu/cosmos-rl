@@ -755,13 +755,25 @@ def policy_to_policy_sync_common(
                 src_rank = self.get_replica_rank(src_replica)
                 nccl_broadcast(tensor, src_rank, self.comm_idx)
 
+            def broadcast_batch(self, tensors, src_replica: str):
+                for tensor in tensors:
+                    self.broadcast(tensor, src_replica)
+
             def send(self, tensor: torch.Tensor, dst_replica: str):
                 dst_rank = self.get_replica_rank(dst_replica)
                 nccl_send(tensor, dst_rank, self.comm_idx)
 
+            def send_batch(self, tensors, dst_replica: str):
+                for tensor in tensors:
+                    self.send(tensor, dst_replica)
+
             def recv(self, tensor: torch.Tensor, src_replica: str):
                 src_rank = self.get_replica_rank(src_replica)
                 nccl_recv(tensor, src_rank, self.comm_idx)
+
+            def recv_batch(self, tensors, src_replica: str):
+                for tensor in tensors:
+                    self.recv(tensor, src_replica)
 
             def shutdown(self):
                 pass
@@ -780,53 +792,75 @@ def policy_to_policy_sync_common(
         policy_worker.mesh_ready = True
         policy_worker.replica_name_to_rank = replica_name_to_rank
 
-        def sample_tensor():
-            sample_tensors = []
-            self_state_dict = policy_worker.trainer.model.state_dict()
-            sample_tensors.append(self_state_dict[sorted(self_state_dict.keys())[0]])
-            sample_tensors.append(self_state_dict[sorted(self_state_dict.keys())[-1]])
+        model_state = policy_worker.trainer.model.state_dict()
 
-            optimizer_state = policy_worker.trainer.optimizers.state_dict()
-            sample_tensors.append(optimizer_state[sorted(optimizer_state.keys())[0]])
-            sample_tensors.append(optimizer_state[sorted(optimizer_state.keys())[-1]])
+        def local_tensor(tensor):
+            if isinstance(tensor, torch.distributed.tensor.DTensor):
+                return tensor.to_local()
+            return tensor
 
-            lr_sheduler_state = policy_worker.trainer.lr_schedulers.state_dict()
-            sample_tensors.append(
-                lr_sheduler_state[sorted(lr_sheduler_state.keys())[0]]
+        # Stamp two small, non-empty distributed model tensors on the source.
+        # This proves the receiver changed because of the command instead of
+        # merely matching an identically initialized model.
+        marker_names = [
+            name
+            for name, tensor in sorted(
+                model_state.items(),
+                key=lambda item: (local_tensor(item[1]).numel(), item[0]),
             )
-            sample_tensors.append(
-                lr_sheduler_state[sorted(lr_sheduler_state.keys())[-1]]
-            )
-            sample_tensors = [
-                tensor.to_local().cpu()
-                if isinstance(tensor, torch.distributed.tensor.DTensor)
-                else tensor.cpu()
-                if isinstance(tensor, torch.Tensor)
-                else tensor
-                for tensor in sample_tensors
-            ]
-            return sample_tensors
-
-        if not send:
-            sample_tensors = sample_tensor()
+            if local_tensor(tensor).numel() > 0
+        ][:2]
+        assert len(marker_names) == 2
+        marker_value = 37 + rank
+        if send:
+            with torch.no_grad():
+                for name in marker_names:
+                    local_tensor(model_state[name]).fill_(marker_value)
+        else:
+            before_sync = {
+                name: local_tensor(model_state[name]).detach().cpu().clone()
+                for name in marker_names
+            }
 
         if isinstance(command, PolicyToPolicyUnicastCommand):
             policy_worker.execute_policy_to_policy_unicast(command)
         elif isinstance(command, PolicyToPolicyBroadcastCommand):
             policy_worker.execute_policy_to_policy_broadcast(command)
 
+        if cosmos_config.train.p2p_sync_pack_tensors:
+            packed_buffer = policy_worker.trainer._p2p_sync_packed_buffer
+            assert packed_buffer.dtype == torch.uint8
+            assert packed_buffer.numel() > 0
+            dtensor_count = sum(
+                isinstance(tensor, torch.distributed.tensor.DTensor)
+                for tensor in policy_worker.trainer.model.state_dict().values()
+            )
+            assert dtensor_count > 0
+            operation = (
+                "UNICAST"
+                if isinstance(command, PolicyToPolicyUnicastCommand)
+                else "BROADCAST"
+            )
+            print(
+                f"P2P_POLICY_{operation}_PACKED_BUFFER_BYTES="
+                f"{packed_buffer.numel()} dtensors={dtensor_count} "
+                f"replica={policy_name} rank={rank}"
+            )
+
         if not send:
-            origin_sample_tensors = sample_tensors
-            sample_tensors = sample_tensor()
-            for tensor, origin_tensor in zip(sample_tensors, origin_sample_tensors):
-                if isinstance(tensor, torch.Tensor):
-                    assert torch.allclose(tensor, origin_tensor), (
-                        f"Tensor values do not match {tensor} {origin_tensor}"
-                    )
-                elif isinstance(tensor, bool):
-                    assert tensor == origin_tensor, (
-                        f"Tensor values do not match {tensor} {origin_tensor}"
-                    )
+            assert policy_worker.model_ready
+            for name in marker_names:
+                received = local_tensor(model_state[name]).detach().cpu()
+                expected = torch.full_like(received, marker_value)
+                assert not torch.equal(before_sync[name], expected), (
+                    f"Receiver tensor {name} already contained the source marker"
+                )
+                torch.testing.assert_close(received, expected)
+            if isinstance(command, PolicyToPolicyUnicastCommand):
+                print(
+                    "P2P_DYNAMIC_SCALE_UNICAST_VERIFIED="
+                    f"replica={policy_name} rank={rank} markers={len(marker_names)}"
+                )
     finally:
         # Detach from shared memory
         shm.close()

@@ -36,7 +36,13 @@ class TestPolicyToPolicy(unittest.TestCase):
         nccl_uid = create_nccl_uid()
         nccl_uid_tensor = torch.tensor(nccl_uid, dtype=torch.int64)
         shms = []
-        world_size = 2
+        world_size = int(os.getenv("COSMOS_TEST_P2P_POLICY_WORLD_SIZE", "2"))
+        if world_size < 1:
+            raise ValueError("COSMOS_TEST_P2P_POLICY_WORLD_SIZE must be positive")
+        if torch.cuda.device_count() < 2 * world_size:
+            self.skipTest(
+                f"requires {2 * world_size} GPUs for two {world_size}-rank policies"
+            )
         for i in range(world_size):
             shms.append(
                 shared_memory.SharedMemory(
@@ -82,7 +88,9 @@ class TestPolicyToPolicy(unittest.TestCase):
                 "policy_recv_from_policy",
             ]
             policy_env = dict(os.environ)
-            policy_env["CUDA_VISIBLE_DEVICES"] = "0,1"
+            policy_env["CUDA_VISIBLE_DEVICES"] = ",".join(
+                str(device) for device in range(world_size)
+            )
             # Start the process
             policy_process = subprocess.Popen(
                 policy_cmd,
@@ -91,7 +99,9 @@ class TestPolicyToPolicy(unittest.TestCase):
                 env=policy_env,
             )
             policy_dst_env = dict(os.environ)
-            policy_dst_env["CUDA_VISIBLE_DEVICES"] = "2,3"
+            policy_dst_env["CUDA_VISIBLE_DEVICES"] = ",".join(
+                str(device) for device in range(world_size, 2 * world_size)
+            )
             policy_dst_process = subprocess.Popen(
                 policy_dst_cmd,
                 stdout=sys.stderr,
