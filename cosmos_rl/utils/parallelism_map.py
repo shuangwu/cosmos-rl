@@ -18,7 +18,7 @@ import torch
 import asyncio
 import multiprocessing
 
-from typing import Dict, List, Tuple, Callable, Any, Optional
+from typing import Dict, List, Tuple, Callable, Any, Optional, Iterable, Iterator
 from concurrent.futures import ProcessPoolExecutor
 from torch.nn.parameter import Parameter
 
@@ -85,12 +85,20 @@ class WeightSyncInstructionsGroup:
     This class contains a list of WeightSyncInstructionsPerParam objects.
     """
 
-    def __init__(self, param_instructions: List[WeightSyncInstructionsPerParam]):
+    def __init__(
+        self,
+        param_instructions: List[WeightSyncInstructionsPerParam],
+        sync_group_index: Optional[int] = None,
+    ):
         """
         Initialize the WeightSyncInstructionsGroup with the given instructions.
         :param param_instructions: A list of WeightSyncInstructionsPerParam objects representing the synchronization instructions for multiple parameters in one group.
+        :param sync_group_index: Controller-assigned global ordinal for this
+            parameter group. All policy and rollout ranks use this ordinal to
+            derive matching NCCL group boundaries.
         """
         self.param_instructions = param_instructions
+        self.sync_group_index = sync_group_index
 
     def __repr__(self):
         # Returning a dictionary representation
@@ -120,7 +128,77 @@ class WeightSyncInstructionsGroup:
             )
             for insts in data["param_instructions"]
         ]
-        return cls(instructions)
+        return cls(instructions, data.get("sync_group_index"))
+
+
+def iter_p2r_sync_rounds(
+    instructions: Iterable[WeightSyncInstructionsGroup],
+    groups_per_round: int,
+) -> Iterator[List[WeightSyncInstructionsGroup]]:
+    """Yield locally relevant P2R instructions in globally aligned rounds.
+
+    A local instruction count is not a safe NCCL grouping boundary: PP and
+    FSDP can make one rollout rank receive a parameter from several policy
+    ranks. The controller-assigned ``sync_group_index`` identifies the same
+    parameter group on both sides, even when intervening groups are absent on
+    a rank.
+
+    A non-positive size preserves the ungrouped behavior by yielding one
+    instruction group at a time.
+    """
+    if groups_per_round <= 0:
+        for instruction in instructions:
+            yield [instruction]
+        return
+
+    pending: List[WeightSyncInstructionsGroup] = []
+    pending_round = None
+    previous_index = -1
+    for instruction in instructions:
+        group_index = instruction.sync_group_index
+        if group_index is None:
+            raise RuntimeError(
+                "P2R NCCL grouping requires controller-assigned sync_group_index"
+            )
+        if group_index < previous_index:
+            raise RuntimeError(
+                "P2R sync_group_index must be monotonically non-decreasing"
+            )
+        previous_index = group_index
+        round_index = group_index // groups_per_round
+        if pending and round_index != pending_round:
+            yield pending
+            pending = []
+        pending_round = round_index
+        pending.append(instruction)
+    if pending:
+        yield pending
+
+
+def build_p2r_sync_group_index(
+    sorted_params_all_rank_policy: Iterable[Iterable[str]],
+    sorted_params_all_rank_rollout: Iterable[Iterable[str]],
+    param_groups: Iterable[Iterable[str]],
+) -> Dict[str, int]:
+    """Assign a deterministic global ordinal to every P2R parameter group."""
+    normalized_groups = sorted(
+        (tuple(group) for group in param_groups), key=lambda group: group[0]
+    )
+    grouped_params = {name for group in normalized_groups for name in group}
+    all_params = {
+        name
+        for params_per_rank in (
+            list(sorted_params_all_rank_policy) + list(sorted_params_all_rank_rollout)
+        )
+        for name in params_per_rank
+    }
+    ungrouped_params = sorted(all_params - grouped_params)
+    sync_groups = [(name,) for name in ungrouped_params] + normalized_groups
+    return {
+        name: group_index
+        for group_index, group in enumerate(sync_groups)
+        for name in group
+    }
 
 
 class ParallelTopoMapper:
@@ -1033,6 +1111,11 @@ class ParallelizedShardMapper:
                 "[ParallelizedShardMapper] Finished unpacking shard infos for both policy and rollout."
             )
             self.param_groups = sorted(self.param_groups, key=lambda x: x[0])
+            self.sync_group_index_by_param = build_p2r_sync_group_index(
+                self.sorted_params_all_rank_policy,
+                self.sorted_params_all_rank_rollout,
+                self.param_groups,
+            )
             policy_parallelism = ParallelDims.from_config_for_analysis(
                 self.config.policy.parallelism,
                 self.policy_world_size,
@@ -1189,7 +1272,10 @@ class ParallelizedShardMapper:
                 )
             if insts_for_group:
                 policy_to_rollout_insts.append(
-                    WeightSyncInstructionsGroup(insts_for_group).__dict__
+                    WeightSyncInstructionsGroup(
+                        insts_for_group,
+                        self.sync_group_index_by_param[dest_name],
+                    ).__dict__
                 )
         for group in self.param_groups:
             insts_for_group = []
@@ -1247,7 +1333,12 @@ class ParallelizedShardMapper:
                     )
             if insts_for_group:
                 policy_to_rollout_insts.append(
-                    WeightSyncInstructionsGroup(insts_for_group).__dict__
+                    WeightSyncInstructionsGroup(
+                        insts_for_group,
+                        self.sync_group_index_by_param[
+                            insts_for_group[0]["param_name"]
+                        ],
+                    ).__dict__
                 )
         if len(name_in_group) > 0:
             logger.warning(
@@ -1374,7 +1465,10 @@ class ParallelizedShardMapper:
                 )
             if insts_for_group:
                 rollout_from_policy_insts.append(
-                    WeightSyncInstructionsGroup(insts_for_group).__dict__
+                    WeightSyncInstructionsGroup(
+                        insts_for_group,
+                        self.sync_group_index_by_param[dest_name],
+                    ).__dict__
                 )
             else:
                 raise ValueError(
@@ -1435,7 +1529,12 @@ class ParallelizedShardMapper:
                     )
             if insts_for_group:
                 rollout_from_policy_insts.append(
-                    WeightSyncInstructionsGroup(insts_for_group).__dict__
+                    WeightSyncInstructionsGroup(
+                        insts_for_group,
+                        self.sync_group_index_by_param[
+                            insts_for_group[0]["param_name"]
+                        ],
+                    ).__dict__
                 )
             else:
                 raise ValueError(

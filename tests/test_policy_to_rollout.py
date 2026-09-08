@@ -29,7 +29,16 @@ from cosmos_rl.utils.pynccl import (
 
 
 class TestPolicyToRollout(unittest.TestCase):
-    def policy_to_rollout_wieght_sync(self, trainable_param_sync: bool = False):
+    def policy_to_rollout_wieght_sync(
+        self,
+        trainable_param_sync: bool = False,
+        *,
+        p2r_groups_per_round: int = 0,
+        policy_tp_size: int = 2,
+        policy_pp_size: int = 1,
+        rollout_tp_size: int = 4,
+        rollout_dp_shard_size: int = 1,
+    ):
         """Test NCCL communication between multiple ranks using torchrun."""
         cur_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -84,6 +93,16 @@ class TestPolicyToRollout(unittest.TestCase):
             ]
             policy_env = dict(os.environ)
             policy_env["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+            policy_env.pop("COSMOS_P2R_NCCL_GROUP_SIZE", None)
+            policy_env.update(
+                {
+                    "COSMOS_TEST_P2R_GROUPS_PER_ROUND": str(p2r_groups_per_round),
+                    "COSMOS_TEST_P2R_POLICY_TP_SIZE": str(policy_tp_size),
+                    "COSMOS_TEST_P2R_POLICY_PP_SIZE": str(policy_pp_size),
+                    "COSMOS_TEST_P2R_ROLLOUT_TP_SIZE": str(rollout_tp_size),
+                    "COSMOS_TEST_P2R_ROLLOUT_DP_SHARD_SIZE": str(rollout_dp_shard_size),
+                }
+            )
             # Start the process
             policy_process = subprocess.Popen(
                 policy_cmd,
@@ -93,6 +112,16 @@ class TestPolicyToRollout(unittest.TestCase):
             )
             rollout_env = dict(os.environ)
             rollout_env["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
+            rollout_env.pop("COSMOS_P2R_NCCL_GROUP_SIZE", None)
+            rollout_env.update(
+                {
+                    "COSMOS_TEST_P2R_GROUPS_PER_ROUND": str(p2r_groups_per_round),
+                    "COSMOS_TEST_P2R_POLICY_TP_SIZE": str(policy_tp_size),
+                    "COSMOS_TEST_P2R_POLICY_PP_SIZE": str(policy_pp_size),
+                    "COSMOS_TEST_P2R_ROLLOUT_TP_SIZE": str(rollout_tp_size),
+                    "COSMOS_TEST_P2R_ROLLOUT_DP_SHARD_SIZE": str(rollout_dp_shard_size),
+                }
+            )
             rollout_process = subprocess.Popen(
                 rollout_cmd,
                 stdout=sys.stderr,
@@ -120,6 +149,31 @@ class TestPolicyToRollout(unittest.TestCase):
 
     def test_policy_to_rollout_wieght_sync_trainable_params(self):
         self.policy_to_rollout_wieght_sync(trainable_param_sync=True)
+
+    def test_policy_to_rollout_grouped_with_pp2_fsdp2(self):
+        self.policy_to_rollout_wieght_sync(
+            p2r_groups_per_round=4,
+            policy_tp_size=1,
+            policy_pp_size=2,
+            rollout_tp_size=2,
+        )
+
+    def test_policy_to_rollout_grouped_with_tp2_fsdp2(self):
+        self.policy_to_rollout_wieght_sync(
+            p2r_groups_per_round=4,
+            policy_tp_size=2,
+            policy_pp_size=1,
+            rollout_tp_size=4,
+        )
+
+    def test_policy_to_rollout_grouped_with_policy_and_rollout_tp2_fsdp2(self):
+        self.policy_to_rollout_wieght_sync(
+            p2r_groups_per_round=4,
+            policy_tp_size=2,
+            policy_pp_size=1,
+            rollout_tp_size=2,
+            rollout_dp_shard_size=2,
+        )
 
 
 if __name__ == "__main__":

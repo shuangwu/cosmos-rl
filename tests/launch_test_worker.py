@@ -101,6 +101,73 @@ POLICY_WORLD_SIZE = 4
 ROLLOUT_WORLD_SIZE = 4
 
 
+def parse_bool_arg(value: str) -> bool:
+    normalized = value.lower()
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise argparse.ArgumentTypeError("expected 'true' or 'false'")
+
+
+def test_p2r_policy_parallelism_config() -> ParallelismConfig:
+    tp_size = int(os.getenv("COSMOS_TEST_P2R_POLICY_TP_SIZE", "2"))
+    pp_size = int(os.getenv("COSMOS_TEST_P2R_POLICY_PP_SIZE", "1"))
+    model_parallel_size = tp_size * pp_size
+    assert POLICY_WORLD_SIZE % model_parallel_size == 0
+    return ParallelismConfig(
+        dp_shard_size=POLICY_WORLD_SIZE // model_parallel_size,
+        cp_size=1,
+        tp_size=tp_size,
+        pp_size=pp_size,
+    )
+
+
+def test_p2r_rollout_parallelism_config() -> ParallelismConfig:
+    tp_size = int(os.getenv("COSMOS_TEST_P2R_ROLLOUT_TP_SIZE", "4"))
+    pp_size = int(os.getenv("COSMOS_TEST_P2R_ROLLOUT_PP_SIZE", "1"))
+    dp_shard_size = int(os.getenv("COSMOS_TEST_P2R_ROLLOUT_DP_SHARD_SIZE", "1"))
+    model_parallel_size = dp_shard_size * tp_size * pp_size
+    assert ROLLOUT_WORLD_SIZE % model_parallel_size == 0
+    return ParallelismConfig(
+        dp_shard_size=dp_shard_size,
+        dp_replicate_size=ROLLOUT_WORLD_SIZE // model_parallel_size,
+        cp_size=1,
+        tp_size=tp_size,
+        pp_size=pp_size,
+    )
+
+
+def test_p2r_groups_per_round() -> int:
+    return int(os.getenv("COSMOS_TEST_P2R_GROUPS_PER_ROUND", "0"))
+
+
+def set_test_parallelism_info(
+    mapper: ParallelTopoMapper,
+    param_name: str,
+    dims_map: Dict[str, int],
+    pp_rank: int,
+) -> None:
+    tensor_dim_to_parallel_map = {}
+    for parallel_dim, tensor_dim in dims_map.items():
+        tensor_dim_to_parallel_map.setdefault(tensor_dim, []).append(parallel_dim)
+    mapper.parallelism_info_for_params[param_name] = (
+        dims_map,
+        tensor_dim_to_parallel_map,
+        pp_rank,
+        None,
+    )
+
+
+def test_param_pipeline_rank(param_name: str, pp_size: int, num_layers: int) -> int:
+    if pp_size == 1 or param_name == "model.embed_tokens.weight":
+        return 0
+    if param_name.startswith("model.layers."):
+        layer = int(param_name.split(".")[2])
+        return min(layer * pp_size // num_layers, pp_size - 1)
+    return pp_size - 1
+
+
 class TestDataset(Dataset):
     def __init__(self, config: CosmosConfig):
         pass
@@ -188,7 +255,7 @@ class TestModel:
             ("model.layers.9.post_attention_layernorm.weight", {}),
             ("model.layers.9.self_attn.k_proj.bias", {"tp": 0}),
             ("model.layers.9.self_attn.k_proj.weight", {"tp": 0}),
-            ("model.layers.9.self_attn.o_proj.weight", {"tp": 0}),
+            ("model.layers.9.self_attn.o_proj.weight", {"tp": 1}),
             ("model.layers.9.self_attn.q_proj.bias", {"tp": 0}),
             ("model.layers.9.self_attn.q_proj.weight", {"tp": 0}),
             ("model.layers.9.self_attn.v_proj.bias", {"tp": 0}),
@@ -213,29 +280,16 @@ class TestModel:
         self.config = AutoConfig.from_pretrained(self.model_path)
         self.device = device
         self.parallel_dims = parallel_dims
-        self.tensors = [
-            (
-                k,
-                (
-                    torch.arange(v.numel(), dtype=torch.float32, device=self.device)
-                    .reshape(v)
-                    .to(self.device)
-                    * 0.001
-                ).requires_grad_(True)
-                if k not in self.keys_to_freeze
-                else (
-                    torch.arange(v.numel(), dtype=torch.float32, device=self.device)
-                    .reshape(v)
-                    .to(self.device)
-                    * 0.001
-                ).requires_grad_(False),
-            )
-            for k, v in self.sorted_hf_key_n_rank
-        ]
         self.sharded_tensors = {}
-        for k, v in self.tensors:
+        for k, shape in self.sorted_hf_key_n_rank:
+            tensor = (
+                torch.arange(shape.numel(), dtype=torch.float32, device=self.device)
+                .reshape(shape)
+                .mul_(0.001)
+                .requires_grad_(k not in self.keys_to_freeze)
+            )
             self.sharded_tensors[k] = convert_weight_from_hf(
-                v, k, self.model_type, self.parallel_dims
+                tensor, k, self.model_type, self.parallel_dims
             )[1]
         self.sorted_sharded_params = [
             (k, self.sharded_tensors[k].ndim) for k, _ in self.sorted_hf_key_n_rank
@@ -288,9 +342,7 @@ class TestPolicyWorker:
         self.global_rank = int(os.environ.get("RANK", 0))
         self.role = Role.POLICY
         self.world_size = policy_world_size
-        policy_parallelism_dims = ParallelismConfig(
-            dp_shard_size=2, cp_size=1, tp_size=2, pp_size=1
-        )
+        policy_parallelism_dims = test_p2r_policy_parallelism_config()
         self.parallel_dims = ParallelDims.from_config(
             policy_parallelism_dims,
         )
@@ -299,6 +351,8 @@ class TestPolicyWorker:
 
         self.config = CosmosConfig()
         self.config.train.param_dtype = "float32"
+        self.config.train.transfer_dtype = "float32"
+        self.config.train.p2r_sync_groups_per_round = test_p2r_groups_per_round()
         cur_dir = os.path.dirname(os.path.abspath(__file__))
         self.config.train.train_policy.dataset.name = os.path.join(
             cur_dir, "data_fixtures", "test_dataset"
@@ -371,9 +425,7 @@ class TestRollout:
         self.global_rank = int(os.environ.get("RANK", 0))
         self.role = Role.ROLLOUT
         self.world_size = rollout_world_size
-        rollout_parallelism_config = ParallelismConfig(
-            dp_shard_size=1, cp_size=1, tp_size=4, pp_size=1
-        )
+        rollout_parallelism_config = test_p2r_rollout_parallelism_config()
         self.parallel_dims = ParallelDims.from_config(
             rollout_parallelism_config,
         )
@@ -393,10 +445,14 @@ class TestRollout:
             k: torch.zeros(v.shape, dtype=v.dtype).to(self.device)
             for k, v in compatibale_map.items()
         }
-        self.ref_compatibale_map = compatibale_map
+        self.ref_compatibale_map = {
+            key: tensor.detach().clone() for key, tensor in compatibale_map.items()
+        }
         self.quantization_type = None
         self.config = CosmosConfig()
-        self.config.train.param_dtype = "float32"  # keep the same as policy above.
+        self.config.train.param_dtype = "float32"
+        self.config.train.transfer_dtype = "float32"
+        self.config.train.p2r_sync_groups_per_round = test_p2r_groups_per_round()
         self.rl_mode = self.config.mode
 
         cur_dir = os.path.dirname(os.path.abspath(__file__))
@@ -414,7 +470,7 @@ class TestRollout:
         self.p2r_collective_manager.unique_ids_cache = policies_comm
         self.p2r_collective_manager.nccl_comm_cache = policies_comm
 
-        self.weight_inplace_view_map = compatibale_map
+        self.weight_inplace_view_map = operate_compatibale_map
         self.recv_param_key_n_rank_list = compatibale_list
         self.quantized_weight_map = {}
         self.hp_weight_map = {}
@@ -427,20 +483,15 @@ class TestRollout:
             DisaggregatedRolloutControlWorker.recv_weight_shard, self
         )
         # change the default parallelism config
-        self.config.rollout.parallelism.tp_size = 4
-        self.config.rollout.parallelism.pp_size = 1
+        self.config.rollout.parallelism = rollout_parallelism_config
 
         self.consume_command = types.MethodType(
             DisaggregatedRolloutControlWorker.consume_command, self
         )
 
-        # Imported here, not at module scope: this helper serves 13 modes and
-        # only the rollout ones need vLLM.  A top-level import made every mode
-        # -- including pure policy/SFT ones that never construct a rollout --
-        # hard-require it, so an image built without vLLM could not run them.
-        from cosmos_rl.rollout.vllm_rollout.vllm_rollout import vLLMRollout
-
-        self.rollout = vLLMRollout(self.config, None, torch.cuda.current_device())
+        # This harness binds the real P2R receive implementation but supplies
+        # its own model/view maps, so no rollout engine is needed.
+        self.rollout = None
 
         self.temp_recv_tensor_queue = Queue()
         self.prepare_trainable_params()
@@ -461,12 +512,8 @@ class TestRollout:
 
 
 async def generate_send_recv_insts(model: TestModel, is_send: bool, global_rank: int):
-    policy_parallelism_config = ParallelismConfig(
-        dp_shard_size=2, cp_size=1, tp_size=2, pp_size=1
-    )
-    rollout_parallelism_config = ParallelismConfig(
-        dp_shard_size=1, cp_size=1, tp_size=4, pp_size=1
-    )
+    policy_parallelism_config = test_p2r_policy_parallelism_config()
+    rollout_parallelism_config = test_p2r_rollout_parallelism_config()
     p_world_size = 4
     r_world_size = 4
 
@@ -501,21 +548,30 @@ async def generate_send_recv_insts(model: TestModel, is_send: bool, global_rank:
         weight_mapper=rollout_weight_mapper,
     )
 
-    def name_to_hf(name: str) -> str:
-        return name
-
     policy_mapper.mapper_group[0].parallelism_info_for_params = {}
     for k, v in model.parallel_spec:
-        policy_mapper.mapper_group[0].insert_to_parallelism_info(
-            param_name=k, dims_map=v | {"dp_shard_cp": 0}, name_to_hf=name_to_hf
+        set_test_parallelism_info(
+            policy_mapper.mapper_group[0],
+            k,
+            v | {"dp_shard_cp": 0},
+            test_param_pipeline_rank(
+                k,
+                policy_parallelism_config.pp_size,
+                model.num_hidden_layers,
+            ),
         )
 
     rollout_mapper.mapper_group[0].parallelism_info_for_params = {}
     for k, v in model.parallel_spec:
-        rollout_mapper.mapper_group[0].insert_to_parallelism_info(
-            param_name=k,
-            dims_map=v | {"dp_shard_cp": 0},
-            name_to_hf=name_to_hf,
+        set_test_parallelism_info(
+            rollout_mapper.mapper_group[0],
+            k,
+            v | {"dp_shard_cp": 0},
+            test_param_pipeline_rank(
+                k,
+                rollout_parallelism_config.pp_size,
+                model.num_hidden_layers,
+            ),
         )
 
     local_shards_p = [
@@ -637,6 +693,7 @@ async def run_rollout_recv_from_policy(shm_name, shm_size, rank, trainable_param
         ROLLOUT_WORLD_SIZE,
         trainable_only=trainable_param_sync,
     )
+
     try:
         # Get NCCL UID from shared memory
         uid_array = np.ndarray((shm_size + 1,), dtype=np.int64, buffer=shm.buf)
@@ -655,8 +712,9 @@ async def run_rollout_recv_from_policy(shm_name, shm_size, rank, trainable_param
             {policy_name + "_" + rollout_name: comm_idx},
             trainable_param_sync,
         )
-        rollout.policy_to_rollout_recv_insts = await generate_send_recv_insts(
-            rollout.model, False, rank
+        recv_insts = await generate_send_recv_insts(rollout.model, False, rank)
+        rollout.api_client = types.SimpleNamespace(
+            post_rollout_shard_recv_insts=lambda _rank: recv_insts
         )
         rollout.weight_mapper.map_to_unsplited_weight_name = {}
         rollout.policy_to_rollout_unicast = types.MethodType(
@@ -674,7 +732,16 @@ async def run_rollout_recv_from_policy(shm_name, shm_size, rank, trainable_param
         rollout.inference_stream.synchronize()
 
         for k, v in rollout.operate_compatibale_map.items():
-            torch.allclose(v, rollout.ref_compatibale_map[k])
+            if command.trainable_only and k not in rollout.trainable_params:
+                expected = torch.zeros_like(v)
+            else:
+                expected = rollout.ref_compatibale_map[k].to(
+                    util.str2torch_dtype(rollout.config.train.transfer_dtype)
+                )
+            try:
+                torch.testing.assert_close(v, expected.to(v.dtype), rtol=0, atol=0)
+            except AssertionError as exc:
+                raise AssertionError(f"P2R mismatch for {k}") from exc
 
     finally:
         # Detach from shared memory
@@ -1369,7 +1436,7 @@ async def parallel_map_check():
         ("model.layers.9.post_attention_layernorm.weight", {}),
         ("model.layers.9.self_attn.k_proj.bias", {"tp": 0}),
         ("model.layers.9.self_attn.k_proj.weight", {"tp": 0}),
-        ("model.layers.9.self_attn.o_proj.weight", {"tp": 0}),
+        ("model.layers.9.self_attn.o_proj.weight", {"tp": 1}),
         ("model.layers.9.self_attn.q_proj.bias", {"tp": 0}),
         ("model.layers.9.self_attn.q_proj.weight", {"tp": 0}),
         ("model.layers.9.self_attn.v_proj.bias", {"tp": 0}),
@@ -1480,6 +1547,46 @@ async def parallel_map_check():
                 assert p_rank >= p_rank_max
                 if p_rank > p_rank_max:
                     p_rank_max = p_rank
+
+    send_group_by_transfer = {}
+    for policy_rank in range(p_world_size):
+        rank_insts = msgpack.unpackb(
+            await generator.get_send_insts_for_policy(policy_rank),
+            strict_map_key=False,
+        )
+        group_indices = [inst["sync_group_index"] for inst in rank_insts]
+        assert group_indices == sorted(group_indices)
+        for inst_group in rank_insts:
+            for param_insts in inst_group["param_instructions"]:
+                for inst in param_insts["instructions"]:
+                    transfer = (
+                        param_insts["param_name"],
+                        inst["policy_rank"],
+                        inst["rollout_rank"],
+                    )
+                    assert transfer not in send_group_by_transfer
+                    send_group_by_transfer[transfer] = inst_group["sync_group_index"]
+
+    recv_group_by_transfer = {}
+    for rollout_rank in range(r_world_size):
+        rank_insts = msgpack.unpackb(
+            await generator.get_recv_insts_for_rollout(rollout_rank),
+            strict_map_key=False,
+        )
+        group_indices = [inst["sync_group_index"] for inst in rank_insts]
+        assert group_indices == sorted(group_indices)
+        for inst_group in rank_insts:
+            for param_insts in inst_group["param_instructions"]:
+                for inst in param_insts["instructions"]:
+                    transfer = (
+                        param_insts["param_name"],
+                        inst["policy_rank"],
+                        inst["rollout_rank"],
+                    )
+                    assert transfer not in recv_group_by_transfer
+                    recv_group_by_transfer[transfer] = inst_group["sync_group_index"]
+
+    assert send_group_by_transfer == recv_group_by_transfer
 
 
 def run_sft_for_sequence_packing(fsdp, tp, cp):
@@ -2670,7 +2777,7 @@ async def main():
     )
     parser.add_argument(
         "--trainable_param_sync",
-        type=bool,
+        type=parse_bool_arg,
         required=False,
         default=False,
         help="If only trainable params are synced. If set, part of the params will be frozen.",

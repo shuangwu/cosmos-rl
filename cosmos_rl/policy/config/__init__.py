@@ -920,6 +920,14 @@ class TrainingConfig(BaseModel):
             "initialization and dynamic-scale state synchronization."
         ),
     )
+    p2r_sync_groups_per_round: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Number of globally ordered parameter groups per P2R NCCL round. "
+            "Zero disables NCCL grouping."
+        ),
+    )
     coalesce_weight_sync: bool = Field(
         default=False,
         description="If True, the controller coalesces (drops) redundant P2R+R2R "
@@ -1559,6 +1567,18 @@ class RolloutConfig(BaseModel):
             "the buffer to the live model before each rollout_generation() call.  "
             "'inference' additionally syncs before each policy forward pass."
         ),
+    )
+    r2r_sync_pack_tensors: bool = Field(
+        default=False,
+        description=(
+            "Pack small tensors into byte-bounded buffers for rollout-to-rollout "
+            "weight synchronization."
+        ),
+    )
+    r2r_sync_bucket_size_bytes: int = Field(
+        default=512 * 1024 * 1024,
+        gt=0,
+        description="Maximum packed R2R transfer size in bytes.",
     )
 
     prefetch_rollout: bool = Field(

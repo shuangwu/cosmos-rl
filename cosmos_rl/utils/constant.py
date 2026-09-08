@@ -126,8 +126,26 @@ def _resolve_rollout_mesh_build_timeout_ms() -> int:
 
 
 COSMOS_ROLLOUT_MESH_BUILD_TIMEOUT_MS = _resolve_rollout_mesh_build_timeout_ms()
-# FIXME: (lms) Setting this greater than 1 could cause P2R NCCL hang when PP and FSDP are both enabled.
 COSMOS_P2R_NCCL_GROUP_SIZE = int(os.environ.get("COSMOS_P2R_NCCL_GROUP_SIZE", "0"))
+
+
+def get_p2r_nccl_group_size(config) -> int:
+    """Resolve P2R groups per NCCL round, preserving the legacy env override."""
+    raw_override = os.environ.get("COSMOS_P2R_NCCL_GROUP_SIZE")
+    if raw_override is not None:
+        try:
+            value = int(raw_override)
+        except ValueError as exc:
+            raise ValueError(
+                "COSMOS_P2R_NCCL_GROUP_SIZE must be a non-negative integer"
+            ) from exc
+    else:
+        value = getattr(getattr(config, "train", None), "p2r_sync_groups_per_round", 0)
+    if value < 0:
+        raise ValueError("P2R NCCL groups per round must be non-negative")
+    return value
+
+
 COSMOS_ROLLOUT_CMD_WAIT_TIMEOUT = int(
     os.environ.get("COSMOS_ROLLOUT_CMD_WAIT_TIMEOUT", "600")
 )

@@ -29,6 +29,7 @@ from cosmos_rl.rollout import State
 from cosmos_rl.utils.parallelism_map import (
     ParallelTopoMapperGroup,
     WeightSyncInstructionsGroup,
+    iter_p2r_sync_rounds,
 )
 from cosmos_rl.dispatcher.command import (
     BuildMeshCommand,
@@ -478,7 +479,6 @@ class CosmosTRTLLMWorker(TrtLLMRolloutWorker, PyExecutor):
 
             pending_bytes = [0]
             pending_completions = []
-            pending_groups = 0
 
             def flush_completions(pending_bytes, pending_completions):
                 recv_ready = torch.cuda.Event()
@@ -493,34 +493,28 @@ class CosmosTRTLLMWorker(TrtLLMRolloutWorker, PyExecutor):
                     pending_bytes[0] = 0
                     pending_completions.clear()
 
-            if constant.COSMOS_P2R_NCCL_GROUP_SIZE > 0:
-                nccl_group_start(communicator_index)
-
-            for insts_group in self.policy_to_rollout_recv_insts:
-                # insts_group: WeightSyncInstructionsGroup -> inst collection for a full weight tensor
-                # handle inst group
-                bytes_received, completion_fn = self.recv_weight_shard(
-                    self.global_rank,
-                    insts_group,
-                    communicator_index,
-                    command.do_weight_sync_check,
-                )
-                pending_bytes[0] += bytes_received
-                pending_completions.append(completion_fn)
-                total_bytes_received += bytes_received
-
-                pending_groups += 1
-                if pending_groups >= constant.COSMOS_P2R_NCCL_GROUP_SIZE:
-                    if constant.COSMOS_P2R_NCCL_GROUP_SIZE > 0:
-                        nccl_group_end(communicator_index)
-                    flush_completions(pending_bytes, pending_completions)
-                    if constant.COSMOS_P2R_NCCL_GROUP_SIZE > 0:
-                        nccl_group_start(communicator_index)
-                    pending_groups = 0
-
-            if constant.COSMOS_P2R_NCCL_GROUP_SIZE > 0:
-                nccl_group_end(communicator_index)
-            flush_completions(pending_bytes, pending_completions)
+            p2r_group_size = constant.get_p2r_nccl_group_size(self.config)
+            for sync_round in iter_p2r_sync_rounds(
+                self.policy_to_rollout_recv_insts,
+                p2r_group_size,
+            ):
+                if p2r_group_size > 0:
+                    nccl_group_start(communicator_index)
+                for insts_group in sync_round:
+                    # insts_group: WeightSyncInstructionsGroup -> inst
+                    # collection for a full weight tensor.
+                    bytes_received, completion_fn = self.recv_weight_shard(
+                        self.global_rank,
+                        insts_group,
+                        communicator_index,
+                        command.do_weight_sync_check,
+                    )
+                    pending_bytes[0] += bytes_received
+                    pending_completions.append(completion_fn)
+                    total_bytes_received += bytes_received
+                if p2r_group_size > 0:
+                    nccl_group_end(communicator_index)
+                flush_completions(pending_bytes, pending_completions)
 
             with torch.cuda.stream(copy_stream):
                 copy_finished = torch.cuda.Event()

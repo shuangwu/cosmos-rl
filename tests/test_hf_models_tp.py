@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import copy
+import gc
+import os
 import traceback
 from datetime import timedelta
 
@@ -227,6 +228,8 @@ class TestHFModelTP(unittest.TestCase):
                 }
                 model_class = cosmos_hf_model.model_class
                 del cosmos_hf_model
+                del cosmos_model_list
+                gc.collect()
                 torch.cuda.empty_cache()
 
                 # Load hf model

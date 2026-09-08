@@ -56,7 +56,7 @@ import queue
 import threading
 import time
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -68,6 +68,12 @@ from cosmos_rl.utils.pynccl import (
     nccl_broadcast,
     nccl_group_end,
     nccl_group_start,
+)
+from cosmos_rl.utils.tensor_packing import (
+    iter_tensor_byte_buckets,
+    pack_tensors_into_buffer,
+    packed_nbytes,
+    unpack_tensors_from_buffer,
 )
 
 # Bounded wait for in-flight GPU work on the WeightSyncThread stream during
@@ -908,59 +914,146 @@ def r2r_barrier(
 # ---------------------------------------------------------------------------
 
 
+def _require_r2r_communicator(comm_idx: int) -> None:
+    if comm_idx < 0:
+        raise RuntimeError(
+            "[Rollout] rollout-to-rollout broadcast requested but no global "
+            "mesh communicator exists (the controller reported the mesh "
+            "unused when it was last rebuilt). This replica cannot "
+            "participate; a peer that did build one will wait for it."
+        )
+
+
+def do_nccl_broadcast_tensors(
+    worker,
+    tensors: Sequence[torch.Tensor],
+    src_rank: int,
+    comm_idx: int,
+    stream,
+    *,
+    group_unpacked: bool,
+) -> tuple[int, int]:
+    """Broadcast an ordered tensor selection, optionally packed by bytes.
+
+    ``group_unpacked`` preserves the caller's legacy behavior when packing is
+    disabled: the full-state R2R path uses one NCCL group, while the default
+    trainable-aware path issues its broadcasts individually.
+    """
+    _require_r2r_communicator(comm_idx)
+
+    # FSDP2 state_dict entries are DTensors. R2R peers have matching FSDP
+    # layouts, so each corresponding-rank communicator must broadcast the
+    # local shard rather than the global DTensor wrapper. Besides being the
+    # actual NCCL allocation, the local tensor also makes byte accounting and
+    # packing operate on the transferred size instead of the global size.
+    transfer_source = [
+        tensor.to_local() if isinstance(tensor, DTensor) else tensor
+        for tensor in tensors
+    ]
+    if not transfer_source:
+        return 0, 0
+
+    bytes_broadcast = sum(
+        param.nelement() * param.element_size() for param in transfer_source
+    )
+    non_contig: list[tuple[torch.Tensor, torch.Tensor]] = []
+    with torch.cuda.stream(stream):
+        pack_tensors = getattr(
+            getattr(worker.config, "rollout", None),
+            "r2r_sync_pack_tensors",
+            False,
+        )
+        bucket_size_bytes = getattr(
+            getattr(worker.config, "rollout", None),
+            "r2r_sync_bucket_size_bytes",
+            512 * 1024 * 1024,
+        )
+
+        with torch.inference_mode():
+            transfer_tensors = []
+            for param in transfer_source:
+                if param.is_contiguous():
+                    transfer_tensor = param
+                else:
+                    transfer_tensor = param.contiguous()
+                    non_contig.append((param, transfer_tensor))
+                transfer_tensors.append(transfer_tensor)
+
+            buckets = (
+                list(iter_tensor_byte_buckets(transfer_tensors, bucket_size_bytes))
+                if pack_tensors
+                else []
+            )
+            multi_tensor_buckets = [bucket for bucket in buckets if len(bucket) > 1]
+            if multi_tensor_buckets:
+                required_buffer_bytes = max(
+                    packed_nbytes(bucket) for bucket in multi_tensor_buckets
+                )
+                packed_buffer = getattr(worker, "_r2r_sync_packed_buffer", None)
+                if (
+                    packed_buffer is None
+                    or packed_buffer.device != transfer_tensors[0].device
+                    or packed_buffer.numel() < required_buffer_bytes
+                ):
+                    packed_buffer = torch.empty(
+                        required_buffer_bytes,
+                        dtype=torch.uint8,
+                        device=transfer_tensors[0].device,
+                    )
+                    worker._r2r_sync_packed_buffer = packed_buffer
+
+                is_src = worker.rank_in_rollout_repicas == src_rank
+                for bucket in buckets:
+                    if len(bucket) == 1:
+                        nccl_broadcast(bucket[0], src_rank, comm_idx)
+                        continue
+                    payload = (
+                        pack_tensors_into_buffer(bucket, packed_buffer)
+                        if is_src
+                        else packed_buffer[: packed_nbytes(bucket)]
+                    )
+                    nccl_broadcast(payload, src_rank, comm_idx)
+                    if not is_src:
+                        unpack_tensors_from_buffer(payload, bucket)
+            else:
+                if group_unpacked:
+                    nccl_group_start(comm_idx)
+                for transfer_tensor in transfer_tensors:
+                    nccl_broadcast(transfer_tensor, src_rank, comm_idx)
+                if group_unpacked:
+                    nccl_group_end(comm_idx)
+            for param, recv_tensor in non_contig:
+                param.copy_(recv_tensor)
+    return len(transfer_source), bytes_broadcast
+
+
 def do_nccl_broadcast_grouped(worker, src_replica_name: str, stream) -> tuple:
-    """Grouped NCCL broadcast of all model params using group start/end.
+    """NCCL broadcast of all model params, optionally packed by bytes.
 
     Uses buffer tensors when ``_buffer_state_dict`` exists.
     Returns ``(param_count, bytes_broadcast)``.
     """
-    bytes_broadcast = 0
-    transferred_cnt = 0
-    non_contig: list[tuple[torch.Tensor, torch.Tensor]] = []
-    with torch.cuda.stream(stream):
-        assert worker.rank_in_rollout_repicas >= 0
-        assert len(worker.replica_name_to_rank) > 0
-        comm_idx = worker.global_commnicator_idex
-        if comm_idx < 0:
-            # No mesh communicator was ever built -- the controller reported
-            # the mesh unused, so BuildMeshCommand skipped the collective.
-            #
-            # Every R2R broadcast path funnels through here, which is why the
-            # check lives here rather than at one of the three call sites.
-            # Without it comm_idx=-1 reaches _COMM_REGISTRY and raises a bare
-            # KeyError, and on the async path that KeyError is swallowed as a
-            # generic task failure -- the replica keeps running and silently
-            # never syncs weights, which is worse than stopping.
-            raise RuntimeError(
-                "[Rollout] rollout-to-rollout broadcast requested but no global "
-                "mesh communicator exists (the controller reported the mesh "
-                "unused when it was last rebuilt). This replica cannot "
-                "participate; a peer that did build one will wait for it."
-            )
-        src_rank = worker.replica_name_to_rank[src_replica_name]
+    assert worker.rank_in_rollout_repicas >= 0
+    assert len(worker.replica_name_to_rank) > 0
+    comm_idx = worker.global_commnicator_idex
+    _require_r2r_communicator(comm_idx)
+    src_rank = worker.replica_name_to_rank[src_replica_name]
 
-        buffer_sd = getattr(worker, "_buffer_state_dict", None)
-        if buffer_sd is not None:
-            params_iter = buffer_sd.items()
-        else:
-            model = worker.rollout.get_underlying_model()
-            params_iter = model.state_dict().items()
+    buffer_sd = getattr(worker, "_buffer_state_dict", None)
+    if buffer_sd is not None:
+        tensors = list(buffer_sd.values())
+    else:
+        model = worker.rollout.get_underlying_model()
+        tensors = list(model.state_dict().values())
 
-        with torch.inference_mode():
-            nccl_group_start(comm_idx)
-            for _, param in params_iter:
-                if param.is_contiguous():
-                    nccl_broadcast(param, src_rank, comm_idx)
-                else:
-                    recv_tensor = param.contiguous()
-                    nccl_broadcast(recv_tensor, src_rank, comm_idx)
-                    non_contig.append((param, recv_tensor))
-                bytes_broadcast += param.nelement() * param.element_size()
-                transferred_cnt += 1
-            nccl_group_end(comm_idx)
-            for param, recv_tensor in non_contig:
-                param.copy_(recv_tensor)
-    return transferred_cnt, bytes_broadcast
+    return do_nccl_broadcast_tensors(
+        worker,
+        tensors,
+        src_rank,
+        comm_idx,
+        stream,
+        group_unpacked=True,
+    )
 
 
 # ---------------------------------------------------------------------------

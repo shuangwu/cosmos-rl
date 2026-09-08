@@ -52,13 +52,13 @@ from cosmos_rl.utils.pynccl import (
     create_nccl_uid,
     create_nccl_comm,
     bounded_drain_or_abort,
-    nccl_broadcast,
     nccl_group_start,
     nccl_group_end,
 )
 from cosmos_rl.utils.parallelism_map import (
     ParallelTopoMapperGroup,
     WeightSyncInstructionsGroup,
+    iter_p2r_sync_rounds,
 )
 from cosmos_rl.dispatcher.data.packer.base import BaseDataPacker
 import cosmos_rl.utils.distributed as dist_util
@@ -85,6 +85,7 @@ from cosmos_rl.rollout.worker.weight_sync import (
     sync_buffer_to_live,
     process_wst_deferred_actions,
     do_nccl_broadcast_grouped,
+    do_nccl_broadcast_tensors,
     install_inference_sync,
 )
 
@@ -1390,7 +1391,6 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
 
             pending_bytes = [0]
             pending_completions = []
-            pending_groups = 0
 
             def flush_completions(pending_bytes, pending_completions):
                 recv_ready = torch.cuda.Event()
@@ -1405,73 +1405,68 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                     pending_bytes[0] = 0
                     pending_completions.clear()
 
-            if (
-                self.rl_mode != "colocated_separated"
-                and constant.COSMOS_P2R_NCCL_GROUP_SIZE > 0
-            ):
-                nccl_group_start(comm_id)
-
             skipped_params_cnt = 0
             transferred_params_cnt = 0
             skipped_groups_cnt = 0
             transferred_groups_cnt = 0
+            p2r_group_size = constant.get_p2r_nccl_group_size(self.config)
 
-            for insts_group in self.policy_to_rollout_recv_insts:
-                (
-                    bytes_received,
-                    completion_fn,
-                    skipped_cnt,
-                ) = self.recv_weight_shard(
-                    self.global_rank,
-                    insts_group,
-                    base_mesh_key,
-                    command.trainable_only,
-                    command.do_weight_sync_check,
-                )
-                skipped_params_cnt += skipped_cnt
-                transferred_params_cnt += (
-                    len(insts_group.param_instructions) - skipped_cnt
+            for sync_round in iter_p2r_sync_rounds(
+                self.policy_to_rollout_recv_insts,
+                p2r_group_size,
+            ):
+                round_has_transfers = not command.trainable_only or any(
+                    param_insts.param_name in self.trainable_params
+                    for insts_group in sync_round
+                    for param_insts in insts_group.param_instructions
                 )
                 if (
-                    self.weight_mapper.get_unsplited_weight_name(
-                        insts_group.param_instructions[0].param_name
-                    )
-                    != insts_group.param_instructions[0].param_name
+                    round_has_transfers
+                    and self.rl_mode != "colocated_separated"
+                    and p2r_group_size > 0
                 ):
-                    skipped_groups_cnt += 1 if skipped_cnt > 0 else 0
-                    transferred_groups_cnt += 0 if skipped_cnt > 0 else 1
-                else:
-                    skipped_groups_cnt += skipped_cnt
-                    transferred_groups_cnt += (
+                    nccl_group_start(comm_id)
+                for insts_group in sync_round:
+                    (
+                        bytes_received,
+                        completion_fn,
+                        skipped_cnt,
+                    ) = self.recv_weight_shard(
+                        self.global_rank,
+                        insts_group,
+                        base_mesh_key,
+                        command.trainable_only,
+                        command.do_weight_sync_check,
+                    )
+                    skipped_params_cnt += skipped_cnt
+                    transferred_params_cnt += (
                         len(insts_group.param_instructions) - skipped_cnt
                     )
-
-                pending_bytes[0] += bytes_received
-                pending_completions.append(completion_fn)
-                total_bytes_received += bytes_received
-
-                pending_groups += 1
-                if pending_groups >= constant.COSMOS_P2R_NCCL_GROUP_SIZE:
                     if (
-                        self.rl_mode != "colocated_separated"
-                        and constant.COSMOS_P2R_NCCL_GROUP_SIZE > 0
+                        self.weight_mapper.get_unsplited_weight_name(
+                            insts_group.param_instructions[0].param_name
+                        )
+                        != insts_group.param_instructions[0].param_name
                     ):
-                        nccl_group_end(comm_id)
-                    flush_completions(pending_bytes, pending_completions)
-                    if (
-                        self.rl_mode != "colocated_separated"
-                        and constant.COSMOS_P2R_NCCL_GROUP_SIZE > 0
-                    ):
-                        nccl_group_start(comm_id)
-                    pending_groups = 0
+                        skipped_groups_cnt += 1 if skipped_cnt > 0 else 0
+                        transferred_groups_cnt += 0 if skipped_cnt > 0 else 1
+                    else:
+                        skipped_groups_cnt += skipped_cnt
+                        transferred_groups_cnt += (
+                            len(insts_group.param_instructions) - skipped_cnt
+                        )
 
-            if (
-                self.rl_mode != "colocated_separated"
-                and constant.COSMOS_P2R_NCCL_GROUP_SIZE > 0
-            ):
-                nccl_group_end(comm_id)
+                    pending_bytes[0] += bytes_received
+                    pending_completions.append(completion_fn)
+                    total_bytes_received += bytes_received
 
-            flush_completions(pending_bytes, pending_completions)
+                if (
+                    round_has_transfers
+                    and self.rl_mode != "colocated_separated"
+                    and p2r_group_size > 0
+                ):
+                    nccl_group_end(comm_id)
+                flush_completions(pending_bytes, pending_completions)
 
             with torch.cuda.stream(copy_stream):
                 copy_finished = torch.cuda.Event()
@@ -1578,58 +1573,53 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                 if not trainable_only:
                     self.non_trainable_params_received = True
             else:
-                # Original synchronous per-param broadcast path.
+                # Synchronous trainable-aware broadcast path.
                 self.prepare_trainable_params()
                 skipped_params_cnt = 0
-                transferred_params_cnt = 0
                 logger.info(
                     "[Rollout] Starting broadcasting of parameters to all replicas."
                 )
-                with torch.cuda.stream(self.inference_stream):
-                    assert self.rank_in_rollout_repicas >= 0, (
-                        "[Rollout] rank in rollout replicas should be set before broadcast."
-                    )
-                    # The mesh communicator is skipped when the job has no
-                    # policy replicas. Reaching a broadcast anyway means that
-                    # assumption was wrong; fail here rather than hand -1 to
-                    # NCCL.
-                    assert self.global_commnicator_idex >= 0, (
-                        "[Rollout] global mesh communicator was never built, "
-                        "but a rollout-to-rollout broadcast was requested."
-                    )
-                    assert len(dst_replica_names) == len(self.replica_name_to_rank), (
-                        "[Rollout] The vaild dst replicas num should match the replicas num that this worker holds."
-                    )
+                assert self.rank_in_rollout_repicas >= 0, (
+                    "[Rollout] rank in rollout replicas should be set before broadcast."
+                )
+                # The mesh communicator is skipped when the job has no policy
+                # replicas. Reaching a broadcast anyway means that assumption
+                # was wrong; fail here rather than hand -1 to NCCL.
+                assert self.global_commnicator_idex >= 0, (
+                    "[Rollout] global mesh communicator was never built, "
+                    "but a rollout-to-rollout broadcast was requested."
+                )
+                assert len(dst_replica_names) == len(self.replica_name_to_rank), (
+                    "[Rollout] The vaild dst replicas num should match the replicas num that this worker holds."
+                )
 
-                    src_rank = self.replica_name_to_rank[src_replica_name]
-                    with torch.inference_mode():
-                        for name, parameter in self.rollout.model_param_map(
-                            self.weight_mapper
-                        ).items():
-                            if name not in self.trainable_params and trainable_only:
-                                logger.debug(
-                                    f"[Rollout] Skip {name} in R2R due to non trainable."
-                                )
-                                skipped_params_cnt += 1
-                                continue
-                            transferred_params_cnt += 1
-
-                            recv_tensor = parameter
-                            if not parameter.is_contiguous():
-                                recv_tensor = parameter.contiguous()
-
-                            nccl_broadcast(
-                                recv_tensor, src_rank, self.global_commnicator_idex
-                            )
-
-                            if not parameter.is_contiguous():
-                                parameter.copy_(recv_tensor)
-
-                    if not self.state.weight_synced():
-                        assert not trainable_only, (
-                            "[Rollout] Trainable only must be set to False for the first broadcast."
+                transfer_tensors = []
+                for name, parameter in self.rollout.model_param_map(
+                    self.weight_mapper
+                ).items():
+                    if name not in self.trainable_params and trainable_only:
+                        logger.debug(
+                            f"[Rollout] Skip {name} in R2R due to non trainable."
                         )
-                        self.state.set_weight_synced()
+                        skipped_params_cnt += 1
+                        continue
+                    transfer_tensors.append(parameter)
+
+                src_rank = self.replica_name_to_rank[src_replica_name]
+                transferred_params_cnt, _ = do_nccl_broadcast_tensors(
+                    self,
+                    transfer_tensors,
+                    src_rank,
+                    self.global_commnicator_idex,
+                    self.inference_stream,
+                    group_unpacked=False,
+                )
+
+                if not self.state.weight_synced():
+                    assert not trainable_only, (
+                        "[Rollout] Trainable only must be set to False for the first broadcast."
+                    )
+                    self.state.set_weight_synced()
 
                 logger.info(
                     f"[Rollout] Finished broadcasting of parameters to all replicas. While {skipped_params_cnt} unsplitted non-trainable params skipped and {transferred_params_cnt} unsplitted params transferred."
