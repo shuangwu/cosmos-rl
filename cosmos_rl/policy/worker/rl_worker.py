@@ -105,6 +105,40 @@ def _bind_p2p_nccl_hook(
     )
 
 
+class P2RDrainAborted(RuntimeError):
+    """The P2R stream never drained and every communicator was aborted."""
+
+
+def _drain_or_fail(
+    stream, timeout_s: float, context: str, src: str, dst: str, weight_step
+) -> None:
+    """Bounded-drain the P2R stream, and fail the replica if it had to abort.
+
+    ``bounded_drain_or_abort`` returns False only after calling
+    ``nccl_abort_all``: the peer vanished mid-collective and every communicator
+    on this replica is gone.  Ignoring that -- which this call site used to do
+    -- reports the weight sync as successful and returns to the main loop with
+    nothing left to talk to.  The policy then sits idle and never unregisters,
+    so the controller does not see a dead policy, its
+    COSMOS_SHUTDOWN_ON_NO_POLICY_REPLICAS escalation never fires, and the job
+    holds its nodes until the wall clock (job 2148080, silent for 16 minutes
+    after the abort while seven rollouts had already exited).
+
+    Raising instead takes the path the P2R send failure already takes, which
+    unregisters on the way down and exits non-zero -- a failed weight sync must
+    not look like a successful run to the scheduler.
+    """
+    if bounded_drain_or_abort(stream, timeout_s, context):
+        return
+    raise P2RDrainAborted(
+        f"[Policy] Weight sync to rollout {dst} at step {weight_step} never "
+        f"drained: in-flight GPU work on {src} exceeded {timeout_s:.0f}s and "
+        "every NCCL communicator was aborted, so this replica cannot continue. "
+        "The destination almost certainly failed its P2R receive; check its log "
+        "for a cancelled R2R round."
+    )
+
+
 class RLPolicyWorker(PolicyWorkerBase):
     """
     RL Policy Worker. This worker is responsible for the training of the RL.
@@ -578,6 +612,31 @@ class RLPolicyWorker(PolicyWorkerBase):
                                         view.numel() * view.element_size()
                                     )
                         grouped_send(grouped_send_ops)
+                except Exception as e:
+                    # Say what happened before the job dies.  Nothing here
+                    # recovers a P2R failure -- the handler deliberately
+                    # re-raises -- but the bare NCCL error that reaches the
+                    # launcher names neither the peer nor the weight step, and
+                    # the operator is left with "asynchronous error 6" and no
+                    # thread to pull.
+                    #
+                    # The usual cause is a failed receive on the destination
+                    # rollout, which this side has no direct way to learn:
+                    # NCCL leaves the posted sends pending rather than failing
+                    # them, so what surfaces here is the drain timeout firing
+                    # and tearing the communicator out from under the send.
+                    # Job 2147521 measured the interval at 120s whether or not
+                    # the destination aborts the pair on its way out.
+                    logger.error(
+                        "[Policy] Weight sync to rollout %s at step %s failed "
+                        "during the P2R send: %s. The job will stop. If the "
+                        "destination logged a failed P2R receive, that is the "
+                        "cause and this is its consequence.",
+                        command.dst_replica_name,
+                        command.weight_step,
+                        e,
+                    )
+                    raise
                 finally:
                     if self.config.policy.lora is not None:
                         # Always attempt to unmerge to restore training state
@@ -592,10 +651,13 @@ class RLPolicyWorker(PolicyWorkerBase):
                             "Trainable synced params count must match at each weight sync."
                         )
 
-        bounded_drain_or_abort(
+        _drain_or_fail(
             self.train_stream,
             COSMOS_P2R_STREAM_DRAIN_TIMEOUT_S,
             f"policy_P2R[{self.replica_name}@step{command.weight_step}]",
+            self.replica_name,
+            command.dst_replica_name,
+            command.weight_step,
         )
         time_eclapsed = time.time() - st
         logger.debug(

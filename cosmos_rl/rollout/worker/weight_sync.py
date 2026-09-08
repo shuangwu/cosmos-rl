@@ -115,6 +115,53 @@ class AsyncR2RSyncMode(Enum):
 _R2R_BARRIER_TIMEOUT_S = 120
 _SYNC_NOOP_LOG_INTERVAL = 50
 
+# Payload published on the barrier's go-channel to cancel a round, and the
+# companion key a late subscriber reads instead.  Both are needed: pub/sub only
+# reaches workers that have already subscribed, and the key only reaches
+# workers that look at it.
+_R2R_ABORT_SIGNAL = "abort"
+
+# Marker prefix on the stored abort reason.  The check has to be "this value is
+# an abort record", not "this key holds something": the abort key shares a
+# namespace with the barrier counter, and a client that answers a GET for a key
+# it was never given -- a loose test double, a misconfigured proxy -- would
+# otherwise cancel every healthy round.
+_R2R_ABORT_MARKER = "cosmos-r2r-abort:"
+
+
+class R2RAborted(RuntimeError):
+    """The R2R round was cancelled before any NCCL work was launched.
+
+    Raised on every participant, including the ones that were ready: the round
+    did not happen.  It is terminal for the job.
+
+    Nothing recovers a cancelled round.  Waiting for the next
+    ``sync_weight_interval`` does not: the rollouts keep the pre-cancellation
+    weights, so every prompt exceeds ``allowed_outdated_steps`` and is
+    rejected, no rollouts are reported, and the trainer never reaches the next
+    sync boundary -- the round that would break the cycle is gated behind the
+    thing the cancelled round stopped.  On Slurm job 2142899 the last
+    completed sync was step 6; the controller then logged "Soft throttle still
+    engaged" 67 times, out to 195s, until the job was killed.
+
+    Re-issuing the round does not either.  Retrying the same step needs its own
+    rendezvous, because these Redis keys are step-scoped and the barrier
+    counter is a monotonic INCR: on job 2143533 a second attempt kept
+    incrementing the first one's counter, every arriver read a count already
+    past the world size and declared itself the last worker -- 8/7 through 12/7
+    inside one second, five workers each publishing its own go signal -- and
+    the barrier stopped synchronising anything.  Rotating to a different source
+    does not work either: the P2R protocol negotiates shard instructions per
+    target, so a replica that has never been one starts from nothing.
+
+    So the rollout workers are failed loudly instead, at the point where the
+    cause is still attributable, rather than idling on a round that will never
+    complete.  Note this does not by itself release the allocation: the policy
+    hangs in its own teardown and never unregisters, so the controller's
+    dead-policy escalation does not fire.  That is pre-existing (job 2142899
+    behaves the same way without any of this) and is not addressed here.
+    """
+
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -402,6 +449,11 @@ class WeightSyncThread:
         # transfers are superseded before they are ever adopted.
         self._max_qdepth = 0
         self._executed = 0
+        # Outcome of the most recent P2R, as opposed to ``_task_failed`` which
+        # latches any failure until a mesh rebuild clears it.  The R2R source
+        # guard needs "did the P2R I am about to broadcast actually land",
+        # which a sticky flag cannot answer.
+        self._p2r_failed = False
         self._thread = threading.Thread(
             target=self._run,
             daemon=True,
@@ -613,6 +665,18 @@ class WeightSyncThread:
                     self._execute_p2r(command)
                 elif cmd_type == "r2r":
                     self._execute_r2r(command)
+            except R2RAborted as exc:
+                # A cancelled round ends the job.  Continuing does not work:
+                # the rollouts hold weights the trainer has moved past, every
+                # prompt is rejected for staleness, nothing is reported, and
+                # the trainer never reaches the next sync boundary -- so the
+                # job stalls silently while holding its allocation.  Fail here
+                # instead, naming the source and the reason.
+                logger.error(
+                    "[WeightSyncThread] R2R round cancelled, failing the job: %s",
+                    exc,
+                )
+                _fail_the_job(self._worker)
             except Exception:
                 self._task_failed = True
                 logger.exception(
@@ -627,7 +691,12 @@ class WeightSyncThread:
     def _execute_p2r(self, command) -> None:
         """Run the P2R receive on the WST's CUDA stream."""
         t0 = time.monotonic()
-        self._worker._execute_p2r_recv(command, self._stream)
+        try:
+            self._worker._execute_p2r_recv(command, self._stream)
+        except BaseException:
+            self._p2r_failed = True
+            raise
+        self._p2r_failed = False
 
         self._last_event = torch.cuda.Event()
         self._last_event.record(self._stream)
@@ -643,6 +712,43 @@ class WeightSyncThread:
             self._queue.qsize(),
             self._executed,
         )
+
+    def _assert_seeded_before_broadcast(self, command, weight_step) -> None:
+        """Cancel the round unless this replica can legitimately be the source.
+
+        Only the source can tell: the destinations have nothing to compare
+        against, and the controller does not learn whether a P2R succeeded.
+        Cancelling here -- before the barrier and before any NCCL call -- is
+        what keeps the peers from paying the barrier and broadcast timeouts.
+        """
+        worker = self._worker
+        if getattr(worker, "replica_name", None) != getattr(
+            command, "src_replica_name", None
+        ):
+            return
+
+        # Never seeded: no P2R and no earlier R2R has landed, so the buffer
+        # still holds whatever the engine loaded at startup.
+        never_seeded = getattr(worker, "_buffer_version", 0) <= 0
+        # Seeded once, but the P2R staging *this* round threw.  Broadcasting
+        # now would hand out stale weights under the new step number.
+        stale = getattr(self, "_p2r_failed", False)
+        if not (never_seeded or stale):
+            return
+
+        reason = (
+            f"rollout {worker.replica_name} was selected as the R2R source for "
+            f"step {weight_step} but its own weights are not valid ("
+            + (
+                "no weight sync has ever completed"
+                if never_seeded
+                else "the P2R staging this round failed"
+            )
+            + "); cancelling the round rather than broadcasting stale or "
+            "uninitialised weights to every rollout replica"
+        )
+        abort_r2r_round(worker, weight_step, reason)
+        raise R2RAborted(reason)
 
     def _execute_r2r(self, command) -> None:
         """Redis barrier + grouped NCCL broadcast on buffer_model.
@@ -661,11 +767,32 @@ class WeightSyncThread:
             worker.data_packer.flush_pending_sends()
 
         weight_step = command.weight_step
+
+        # Refuse to broadcast weights this replica does not have.
+        #
+        # The controller picks the R2R source from
+        # ``weights_loaded_in_view_of_command``, which is set when the P2R is
+        # *published* and never cleared on failure, so a source whose P2R threw
+        # is still chosen.  ``_run`` turns that exception into a log line and a
+        # flag and then runs the next queued command -- the R2R -- so without
+        # this check the source broadcasts an unseeded buffer.  Every
+        # destination would accept it, set the sticky ``weight_synced`` bit, and
+        # start generating against base weights while reporting them as the
+        # current version.  Nothing raises; the wrong weights simply train.
         # Use the controller's authoritative recipient set for this round as the
         # barrier participant count so it stays in lockstep as replicas finish.
         expected_world_size = len(getattr(command, "dst_replica_names", None) or [])
+
+        # Only meaningful when weights actually leave this replica.  A
+        # single-member round broadcasts nothing (see the branch below), so
+        # there is no peer to protect and nothing to cancel.
+        if expected_world_size > 1:
+            self._assert_seeded_before_broadcast(command, weight_step)
+
         if expected_world_size > 1 and not r2r_barrier(
-            worker, weight_step, expected_world_size=expected_world_size
+            worker,
+            weight_step,
+            expected_world_size=expected_world_size,
         ):
             logger.info(
                 "[WeightSyncThread] R2R cancelled during teardown (step=%s)",
@@ -798,8 +925,95 @@ def setup_redis_barrier(worker) -> None:
     )
 
 
+def _read_abort_reason(r2r_redis, abort_key: str, weight_step: int):
+    """Return this round's cancellation reason, or None if it was not cancelled.
+
+    Only a value carrying :data:`_R2R_ABORT_MARKER` counts.  Anything else --
+    including whatever a client returns for a key that was never set -- is not
+    an abort record and must not cancel the round.
+    """
+    try:
+        raw = r2r_redis.get(abort_key)
+    except Exception:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    if not isinstance(raw, str) or not raw.startswith(_R2R_ABORT_MARKER):
+        return None
+    reason = raw[len(_R2R_ABORT_MARKER) :]
+    return reason or f"R2R round for step {weight_step} was cancelled by its source"
+
+
+def _round_keys(prefix: str, weight_step: int) -> tuple:
+    """Barrier counter, go channel and abort marker for one round.
+
+    One round per step: a cancelled round ends the job rather than being
+    retried, so ``weight_step`` is a sufficient round identity and these are
+    the key names the fleet has always used.
+    """
+    return (
+        f"{prefix}:barrier:{weight_step}",
+        f"{prefix}:go:{weight_step}",
+        f"{prefix}:abort:{weight_step}",
+    )
+
+
+def _fail_the_job(worker) -> None:
+    """Bring the worker down after a cancelled round.
+
+    Uses the same signals as the ordinary teardown path
+    (``rollout_control.handle_shutdown``) rather than raising out of the
+    weight-sync thread, whose exceptions its own run loop catches -- that would
+    leave the worker alive but permanently unable to sync.
+    """
+    for attr in ("shutdown_signal", "shutdown_mp_signal"):
+        signal = getattr(worker, attr, None)
+        if signal is not None and not signal.is_set():
+            signal.set()
+
+
+def abort_r2r_round(worker, weight_step: int, reason: str) -> bool:
+    """Cancel this R2R round for every participant, as fast as Redis allows.
+
+    Publishes on the barrier's go-channel so workers already waiting wake on
+    their next ``get_message`` poll -- about a second -- and writes the reason
+    to a key so workers that have not subscribed yet still see it.  Without
+    both, a cancelled round costs the barrier timeout and then a full
+    ``COSMOS_NCCL_TIMEOUT_MS`` blocking in ``ncclBroadcast``.
+
+    Returns whether the signal was delivered; a Redis failure here is not
+    fatal, it only means the peers fall back to those timeouts.
+    """
+    r2r_redis = getattr(worker, "_r2r_redis", None)
+    if r2r_redis is None:
+        return False
+    prefix = getattr(worker, "_r2r_barrier_prefix", None)
+    if not prefix:
+        return False
+    try:
+        _, go_channel, abort_key = _round_keys(prefix, weight_step)
+        r2r_redis.set(abort_key, f"{_R2R_ABORT_MARKER}{reason}")
+        r2r_redis.expire(abort_key, 600)
+        r2r_redis.publish(go_channel, _R2R_ABORT_SIGNAL)
+        logger.error(
+            "[R2R Barrier] Cancelled step %s for all participants: %s",
+            weight_step,
+            reason,
+        )
+        return True
+    except Exception:
+        logger.exception(
+            "[R2R Barrier] Could not publish the abort for step %s; peers will "
+            "fall back to the barrier and NCCL timeouts.",
+            weight_step,
+        )
+        return False
+
+
 def r2r_barrier(
-    worker, weight_step: int, expected_world_size: Optional[int] = None
+    worker,
+    weight_step: int,
+    expected_world_size: Optional[int] = None,
 ) -> bool:
     """Redis-based barrier so all rollout workers start R2R broadcast together.
 
@@ -828,10 +1042,16 @@ def r2r_barrier(
         return True
 
     prefix = worker._r2r_barrier_prefix
-    barrier_key = f"{prefix}:barrier:{weight_step}"
-    go_channel = f"{prefix}:go:{weight_step}"
+    barrier_key, go_channel, abort_key = _round_keys(prefix, weight_step)
 
     try:
+        # A round cancelled by its source (see ``abort_r2r_round``) must not be
+        # joined at all.  Check before incrementing so this worker is not
+        # counted towards a go signal that will never be useful.
+        aborted = _read_abort_reason(r2r_redis, abort_key, weight_step)
+        if aborted is not None:
+            raise R2RAborted(aborted)
+
         count = r2r_redis.incr(barrier_key)
         r2r_redis.expire(barrier_key, 600)
 
@@ -857,6 +1077,12 @@ def r2r_barrier(
         pubsub = r2r_redis.pubsub()
         pubsub.subscribe(go_channel)
         try:
+            # Re-read after subscribing: an abort published between the
+            # check above and ``subscribe`` would otherwise be missed.
+            aborted = _read_abort_reason(r2r_redis, abort_key, weight_step)
+            if aborted is not None:
+                raise R2RAborted(aborted)
+
             recheck = int(r2r_redis.get(barrier_key) or 0)
             if recheck >= world_size:
                 elapsed_ms = (time.monotonic() - t0) * 1000
@@ -885,6 +1111,14 @@ def r2r_barrier(
                     return False
                 msg = pubsub.get_message(timeout=1.0)
                 if msg is not None and msg.get("type") == "message":
+                    payload = msg.get("data")
+                    if isinstance(payload, bytes):
+                        payload = payload.decode("utf-8", "replace")
+                    if payload == _R2R_ABORT_SIGNAL:
+                        raise R2RAborted(
+                            _read_abort_reason(r2r_redis, abort_key, weight_step)
+                            or f"R2R round for step {weight_step} was cancelled"
+                        )
                     break
             else:
                 logger.warning(
@@ -904,6 +1138,10 @@ def r2r_barrier(
             elapsed_ms,
         )
         return True
+    except R2RAborted:
+        # An explicit cancellation, not a Redis fault. Propagate it: proceeding
+        # would enter a collective whose source has already walked away.
+        raise
     except Exception as exc:
         logger.warning("[R2R Barrier] Redis error (%s); skipping barrier.", exc)
         return True
