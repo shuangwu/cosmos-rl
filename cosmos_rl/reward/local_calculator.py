@@ -21,7 +21,59 @@ from cosmos_rl.dispatcher.algo.reward import Reward
 from cosmos_rl.dispatcher.data.packer import BaseDataPacker
 from cosmos_rl.policy.config import Config
 from cosmos_rl.reward.base import RolloutGroup
+from cosmos_rl.reward.admission import (
+    aggregate_excluded_reward_metrics,
+    select_payload_completions,
+)
 import cosmos_rl.utils.util as util
+
+
+def _training_payload_from_rollouts(
+    source_payload: RLPayload,
+    rollout_group: RolloutGroup,
+    rollouts: List[Rollout],
+    *,
+    valid: bool,
+) -> RLPayload:
+    admission = rollout_group.completion_admission
+    assert admission is not None
+    selected = select_payload_completions(source_payload, admission)
+    if not admission.explicit:
+        # Preserve the historical local-reward payload shape when no producer
+        # opts into admission. The old reconstruction did not forward extra_info.
+        selected.extra_info = None
+    selected.reference_answer = None
+    selected.valid = valid
+    selected.completions = [rollout.completion for rollout in rollouts]
+    selected.completed_conversations = [
+        rollout.completed_conversation for rollout in rollouts
+    ]
+    selected.n_ignore_prefix_tokens = [
+        rollout.n_ignore_prefix_tokens for rollout in rollouts
+    ]
+    selected.rewards = [rollout.reward for rollout in rollouts]
+    selected.filter_rewards = [rollout.filter_reward for rollout in rollouts]
+    selected.advantages = [rollout.advantage for rollout in rollouts]
+    selected.completion_logprobs = [
+        rollout.completion_logprobs if rollout.completion_logprobs is not None else []
+        for rollout in rollouts
+    ]
+    selected.completion_token_ids = [
+        rollout.completion_token_ids if rollout.completion_token_ids is not None else []
+        for rollout in rollouts
+    ]
+    selected.report_metrics = [
+        rollout.report_metrics if rollout.report_metrics is not None else {}
+        for rollout in rollouts
+    ]
+    excluded_reward_metrics = aggregate_excluded_reward_metrics(
+        rollout_group.excluded_reward_metrics.values()
+    )
+    if excluded_reward_metrics:
+        if selected.completion_admission_metrics is None:
+            selected.completion_admission_metrics = {}
+        selected.completion_admission_metrics.update(excluded_reward_metrics)
+    return selected
 
 
 class LocalRewardCalculator:
@@ -139,7 +191,9 @@ class LocalRewardCalculator:
         ]
 
         rollouts_list: List[List[Rollout]] = [
-            rollout_group.compute_rollouts(self.val_rl_algo)
+            rollout_group.compute_rollouts(
+                self.val_rl_algo, apply_completion_admission=False
+            )
             for rollout_group in rollout_groups
         ]
         payload_list: List[RLPayload] = []
@@ -224,6 +278,14 @@ class LocalRewardCalculator:
         payload_list: List[RLPayload] = []
         # Dynamic Sampling: Filter out the rollouts that the rewards are all the same
         for idx, rollouts_group in enumerate(rollouts_list):
+            rollout_group = rollout_groups[idx]
+            if not rollouts_group:
+                payload_list.append(
+                    _training_payload_from_rollouts(
+                        payloads[idx], rollout_group, [], valid=False
+                    )
+                )
+                continue
             if self.config.train.non_text:
                 rollout_tokens = []
             else:
@@ -268,93 +330,15 @@ class LocalRewardCalculator:
                                 ].n_ignore_prefix_tokens = n_ignore_prefix_tokens
 
                 payload_list.append(
-                    RLPayload(
-                        prompt=rollouts_group[0].prompt,
-                        prompt_idx=rollouts_group[0].prompt_idx,
-                        conversation=rollouts_group[0].conversation,
-                        completions=[rollout.completion for rollout in rollouts_group],
-                        completed_conversations=[
-                            rollout.completed_conversation for rollout in rollouts_group
-                        ],
-                        reference_answer=None,
-                        n_ignore_prefix_tokens=[
-                            rollout.n_ignore_prefix_tokens for rollout in rollouts_group
-                        ],
-                        rewards=[rollout.reward for rollout in rollouts_group],
-                        filter_rewards=[
-                            rollout.filter_reward for rollout in rollouts_group
-                        ],
-                        advantages=[rollout.advantage for rollout in rollouts_group],
-                        valid=True,
-                        completion_logprobs=[
-                            rollout.completion_logprobs
-                            if rollout.completion_logprobs is not None
-                            else []
-                            for rollout in rollouts_group
-                        ],
-                        completion_token_ids=[
-                            rollout.completion_token_ids
-                            if rollout.completion_token_ids is not None
-                            else []
-                            for rollout in rollouts_group
-                        ],
-                        weight_version=payloads[idx].weight_version,
-                        report_metrics=[
-                            rollout.report_metrics
-                            if rollout.report_metrics is not None
-                            else {}
-                            for rollout in rollouts_group
-                        ],
-                        cumulative_logprob=payloads[idx].cumulative_logprob,
-                        teacher_result_uuids=payloads[idx].teacher_result_uuids,
-                        prompt_logprobs=payloads[idx].prompt_logprobs,
-                        prompt_token_ids=payloads[idx].prompt_token_ids,
+                    _training_payload_from_rollouts(
+                        payloads[idx], rollout_group, rollouts_group, valid=True
                     )
                 )
             else:
                 # If the rewards are all the same, we need to sample one rollout from the group
                 payload_list.append(
-                    RLPayload(
-                        prompt=rollouts_group[0].prompt,
-                        prompt_idx=rollouts_group[0].prompt_idx,
-                        conversation=rollouts_group[0].conversation,
-                        completions=[rollout.completion for rollout in rollouts_group],
-                        completed_conversations=[
-                            rollout.completed_conversation for rollout in rollouts_group
-                        ],
-                        reference_answer=None,
-                        n_ignore_prefix_tokens=[
-                            rollout.n_ignore_prefix_tokens for rollout in rollouts_group
-                        ],
-                        rewards=[rollout.reward for rollout in rollouts_group],
-                        filter_rewards=[
-                            rollout.filter_reward for rollout in rollouts_group
-                        ],
-                        advantages=[rollout.advantage for rollout in rollouts_group],
-                        valid=False,
-                        completion_logprobs=[
-                            rollout.completion_logprobs
-                            if rollout.completion_logprobs is not None
-                            else []
-                            for rollout in rollouts_group
-                        ],
-                        completion_token_ids=[
-                            rollout.completion_token_ids
-                            if rollout.completion_token_ids is not None
-                            else []
-                            for rollout in rollouts_group
-                        ],
-                        weight_version=payloads[idx].weight_version,
-                        report_metrics=[
-                            rollout.report_metrics
-                            if rollout.report_metrics is not None
-                            else {}
-                            for rollout in rollouts_group
-                        ],
-                        cumulative_logprob=payloads[idx].cumulative_logprob,
-                        teacher_result_uuids=payloads[idx].teacher_result_uuids,
-                        prompt_logprobs=payloads[idx].prompt_logprobs,
-                        prompt_token_ids=payloads[idx].prompt_token_ids,
+                    _training_payload_from_rollouts(
+                        payloads[idx], rollout_group, rollouts_group, valid=False
                     )
                 )
         return payload_list, False, step

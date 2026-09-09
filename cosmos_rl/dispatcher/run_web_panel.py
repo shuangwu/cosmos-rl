@@ -56,6 +56,11 @@ from cosmos_rl.dispatcher.protocol import (
     Role,
 )
 from cosmos_rl.policy.config import Config as CosmosConfig
+from cosmos_rl.reward.admission import (
+    COMPLETION_ADMISSION_METRIC_PREFIX,
+    COMPLETION_ADMISSION_REPORT_ID_KEY,
+    DISCARDED_WEIGHT_VERSION_KEY,
+)
 from cosmos_rl.utils.network_util import bind_available_port
 from cosmos_rl.utils.logging import logger
 from cosmos_rl.utils.constant import (
@@ -705,15 +710,30 @@ async def put_rollout_group(rollout: RolloutRequest):
         ]
         policy_status = controller.policy_status_manager
         is_dapo = controller.config.train.train_policy.variant == "dapo"
+        if any(
+            key.startswith(COMPLETION_ADMISSION_METRIC_PREFIX)
+            for key in rollout.metrics
+        ):
+            admission_training_step = policy_status.next_rollout_training_step()
+            policy_status.update_completion_admission_statistics(
+                rollout.metrics,
+                source_replica=rollout.src_replica_name,
+                report_id=rollout.metrics.get(COMPLETION_ADMISSION_REPORT_ID_KEY),
+                training_step=admission_training_step,
+            )
         if "discarded_samples" in rollout.metrics:
             discarded_samples = policy_status._parse_non_negative_count(
                 rollout.metrics, "discarded_samples"
             )
-            policy_status.settle_discarded_samples(
+            settled_count = policy_status.settle_discarded_samples(
                 source_replica=rollout.src_replica_name,
                 report_id=rollout.metrics.get("discard_report_id"),
                 count=discarded_samples,
             )
+            if settled_count > 0:
+                controller.register_discarded_samples_for_refill(
+                    rollout.metrics.get(DISCARDED_WEIGHT_VERSION_KEY), settled_count
+                )
         if policy_status.rollout_admission_closed():
             policy_status.cleanup_terminal_rollouts(
                 rollouts,

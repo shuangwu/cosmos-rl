@@ -20,6 +20,9 @@ from cosmos_rl.utils.constant import Algo
 
 
 class GRPO(RuleBasedAlgo):
+    # A single completion has no useful group-relative advantage.
+    minimum_trainable_completions = 2
+
     def __init__(
         self, reward_fn: Callable, unbiased: bool = False, eps: float = 1e-6, **kwargs
     ):

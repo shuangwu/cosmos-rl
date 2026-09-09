@@ -272,7 +272,9 @@ baked-in code/tests with a working-tree checkout (mounted at `/opt/cosmos-rl`
 and put on `PYTHONPATH`), so you can iterate on code/tests and re-run CI without
 rebuilding the image. Logs land under `<output-root>/cosmos_ci_<timestamp>/slurm/`
 (`slurm_<jobid>.log` plus a `run_<jobid>/run_test.log` with the per-test
-PASS/FAIL summary).
+PASS/FAIL summary). Because `cosmos_rl/_version.py` is generated and ignored,
+mount mode copies that module from the installed package when the checkout does
+not already contain it, before the checkout is added to `PYTHONPATH`.
 
 Use `--dry-run` to print the exact `sbatch` command without submitting.
 

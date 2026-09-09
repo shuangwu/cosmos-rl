@@ -40,6 +40,7 @@ from transformers import GenerationConfig
 from cosmos_rl.dispatcher.data.schema import (
     RLPayload,
 )
+from cosmos_rl.rollout.schema import RolloutResult
 
 
 class TRTLLM_Rollout(RolloutBase):
@@ -129,7 +130,7 @@ class TRTLLM_Rollout(RolloutBase):
         data_packer: BaseDataPacker,
         data_fetcher: DataFetcherBase,
         sampling_params: SamplingParams,
-    ) -> List[List[str]]:
+    ) -> List[RolloutResult]:
         if not self._engine_initialized:
             raise RuntimeError(
                 "[Rollout] Engine is not initialized, please call init_engine first."
@@ -154,7 +155,7 @@ class TRTLLM_Rollout(RolloutBase):
         #   [completion_str, completion_str, ...],
         #   ...
         # ]
-        response: List[List[str]] = []
+        response: List[RolloutResult] = []
         try:
             results = self.rollout_engine.generate(
                 prompts,
@@ -164,7 +165,11 @@ class TRTLLM_Rollout(RolloutBase):
 
             for output in results:
                 response.append(
-                    [output.outputs[i].text for i in range(len(output.outputs))]
+                    RolloutResult(
+                        completions=[
+                            output.outputs[i].text for i in range(len(output.outputs))
+                        ]
+                    )
                 )
         except Exception as e:
             logger.error(f"[Rollout] Failed in rollout generation: {str(e)}")

@@ -15,6 +15,7 @@
 
 import time
 import math
+from collections import OrderedDict
 from queue import Empty, Queue
 from strenum import StrEnum
 from typing import Dict, List, Iterator, Any, Optional, Callable
@@ -35,6 +36,11 @@ from cosmos_rl.dispatcher.data.data_fetcher import ControllerDataFetcher
 from transformers import AutoTokenizer
 import numpy as np
 from cosmos_rl.utils.util import aggregate_report_data
+
+
+# HTTP retries are immediate; retaining the most recent reports bounds memory
+# while covering a much larger window than any request can remain in flight.
+_REPORT_DEDUP_WINDOW = 4096
 
 
 # Debug-only accounting log for ``samples_on_the_fly``. Only the mutation
@@ -282,7 +288,10 @@ class PolicyStatusManager:
         self.rollout_buffer = Queue()
         self.remain_samples_num = 0
         self.samples_on_the_fly = 0
-        self._applied_discard_report_ids: Dict[str, set[str]] = {}
+        self._applied_discard_report_ids: Dict[str, OrderedDict[str, None]] = {}
+        self._applied_completion_admission_report_ids: Dict[
+            str, OrderedDict[str, None]
+        ] = {}
 
         # Actual rollout count for each in-flight real training command.
         # Entries are keyed by the command step and consumed after its full
@@ -310,6 +319,7 @@ class PolicyStatusManager:
 
         # Record filter rewards distribution for dynamic sampling
         self.filter_records = {}
+        self.completion_admission_records: Dict[int, Dict[str, int | float]] = {}
 
         # Non-validation RL: explicit end-of-data phase (see ``JobPhase``).
         self.job_phase = JobPhase.RUNNING
@@ -1109,6 +1119,23 @@ class PolicyStatusManager:
             return sum(q.qsize() for q in self.rollout_buffer_per_rank)
         return self.rollout_buffer.qsize()
 
+    def next_rollout_training_step(self) -> int:
+        """Return the training step targeted by the next arriving rollout.
+
+        Policy execution is serial, but rollout production may fill multiple
+        future batches while the current policy step is running. Existing
+        buffered rollouts therefore determine which undispatched step owns a
+        new admission report; generation weight alone does not when outdated
+        rollouts are allowed.
+        """
+
+        required_rollouts = self.config.train.train_batch_per_replica * max(
+            len(self.get_all_atoms_arrived_replicas()), 1
+        )
+        return (
+            self.current_step + self.total_pending_rollouts() // required_rollouts + 1
+        )
+
     @staticmethod
     def _parse_non_negative_count(metrics: Dict[str, Any], key: str) -> int:
         value = metrics.get(key, 0)
@@ -1163,10 +1190,14 @@ class PolicyStatusManager:
             )
             return 0
 
-        applied_ids = self._applied_discard_report_ids.setdefault(source_replica, set())
+        applied_ids = self._applied_discard_report_ids.setdefault(
+            source_replica, OrderedDict()
+        )
         if report_id in applied_ids:
             return 0
-        applied_ids.add(report_id)
+        applied_ids[report_id] = None
+        if len(applied_ids) > _REPORT_DEDUP_WINDOW:
+            applied_ids.popitem(last=False)
 
         self.filter_records["rollout_failed"] = (
             self.filter_records.get("rollout_failed", 0) + count
@@ -1177,6 +1208,7 @@ class PolicyStatusManager:
     def forget_discard_reports(self, source_replica: str) -> None:
         """Release discard-report deduplication state for an ended replica."""
         self._applied_discard_report_ids.pop(source_replica, None)
+        self._applied_completion_admission_report_ids.pop(source_replica, None)
 
     def _discard_rollouts(self, rollouts: List[Rollout], source: str) -> int:
         if not rollouts:
@@ -1332,6 +1364,76 @@ class PolicyStatusManager:
         # Filtered DAPO generations have no payload and can never reach a
         # training ACK, so settle their prompt-side in-flight accounting here.
         self._settle_samples_on_the_fly(filtered_count, "dapo_filter")
+
+    def update_completion_admission_statistics(
+        self,
+        metrics: Optional[Dict[str, Any]],
+        *,
+        source_replica: str,
+        report_id: Any,
+        training_step: Any,
+    ) -> bool:
+        """Idempotently accumulate admission counters by target training step."""
+
+        if not isinstance(report_id, str) or not report_id:
+            logger.warning(
+                "[Controller] Ignoring completion-admission telemetry from %s "
+                "without a non-empty report ID",
+                source_replica,
+            )
+            return False
+        if type(training_step) is not int or training_step < 1:
+            logger.warning(
+                "[Controller] Ignoring completion-admission telemetry from %s "
+                "with invalid training step %r",
+                source_replica,
+                training_step,
+            )
+            return False
+
+        applied_ids = self._applied_completion_admission_report_ids.setdefault(
+            source_replica, OrderedDict()
+        )
+        if report_id in applied_ids:
+            return False
+        applied_ids[report_id] = None
+        if len(applied_ids) > _REPORT_DEDUP_WINDOW:
+            applied_ids.popitem(last=False)
+
+        records = self.completion_admission_records.setdefault(training_step, {})
+
+        for key in metrics or {}:
+            if not key.startswith("rollout/completion_admission_"):
+                continue
+            if key.startswith(
+                "rollout/completion_admission_excluded_reward_"
+            ) and key.endswith("_sum"):
+                value = metrics.get(key)
+                if (
+                    isinstance(value, (int, float, np.number))
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                ):
+                    increment: int | float = float(value)
+                else:
+                    logger.warning(
+                        "[Controller] Ignoring malformed admission telemetry "
+                        "%s=%r; expected a finite number",
+                        key,
+                        value,
+                    )
+                    continue
+            else:
+                increment = self._parse_non_negative_count(metrics, key)
+            records[key] = records.get(key, 0) + increment
+        return True
+
+    def _take_completion_admission_statistics(
+        self, training_step: int
+    ) -> Dict[str, int | float]:
+        """Return admission metrics assigned to one training step."""
+
+        return self.completion_admission_records.pop(training_step, {})
 
     def filter_outdated_rollouts(self, rollouts: List[Rollout]) -> List[Rollout]:
         """
@@ -1598,6 +1700,11 @@ class PolicyStatusManager:
         self.set_status(replica_name, PolicyStatus.REDUCED)
 
         if self.all_reduced():
+            # Admission metadata is step-scoped. Snapshot and clear it at the
+            # step boundary even when logging is disabled or reporting fails.
+            completion_admission_records = self._take_completion_admission_statistics(
+                step
+            )
             _sotf_before = self.samples_on_the_fly
             # Settle exactly the rollout count recorded for this real command.
             _missing_dispatch = object()
@@ -1719,6 +1826,7 @@ class PolicyStatusManager:
                     policy_report_data = aggregate_report_data(
                         self.report_data_list, policy_report_data
                     )
+                    policy_report_data.update(completion_admission_records)
                     if self.config.mode == "colocated":
                         for data in self.report_data_list:
                             # Handle dynamic sampling statistics update in colocated mode

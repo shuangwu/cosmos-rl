@@ -56,6 +56,14 @@ from cosmos_rl.dispatcher.data.schema import (
     RLPayload,
 )
 from cosmos_rl.reward.dispatcher import RewardDispatcher
+from cosmos_rl.reward.admission import (
+    apply_rollout_result_to_payload,
+    consume_completion_admission_metrics,
+    normalize_rollout_results,
+    prepare_completion_admission_report,
+    select_rollout_result_completions,
+)
+from cosmos_rl.rollout.schema import RolloutResult
 from cosmos_rl.dispatcher.data.packer.base import BaseDataPacker
 from cosmos_rl.dispatcher.data.data_fetcher import WorkerDataFetcher
 
@@ -198,6 +206,8 @@ class TRTLLMRolloutWrapper(TRTLLMRolloutWorkerBase):
             if payloads is not None:
                 if is_validation:
                     break
+                payloads, metadata = consume_completion_admission_metrics(payloads)
+                metadata = prepare_completion_admission_report(metadata, step)
                 for i in range(len(payloads)):
                     (
                         payloads[i].completions,
@@ -218,6 +228,7 @@ class TRTLLMRolloutWrapper(TRTLLMRolloutWorkerBase):
                 response = RolloutRequest(
                     src_replica_name=self.replica_name,
                     payloads=payloads,
+                    metrics=metadata,
                     is_end=False,
                 )
                 self.api_client.post_rollout_completion(response)
@@ -316,24 +327,29 @@ class TRTLLMRolloutWrapper(TRTLLMRolloutWorkerBase):
 
                     if not validation_queue.empty():
                         payloads_list: List[RLPayload] = validation_queue.get()
-                        completions: List[List[str]] = self.rollout.rollout_generation(
+                        generated = self.rollout.rollout_generation(
                             payloads=payloads_list,
                             data_packer=self.val_data_packer,
                             data_fetcher=self.data_fetcher,
                             sampling_params=self.val_sampling_params,
                         )
-                        if completions:
+                        results = normalize_rollout_results(generated)
+                        if results:
                             prompt_payloads.extend(payloads_list)
-                            validation_results.extend(completions)
+                            validation_results.extend(results)
 
                     if is_end:
                         break
 
                     validation_payloads = []
-                    for old_payload, completions in zip(
-                        prompt_payloads, validation_results
-                    ):
-                        old_payload.completions = completions
+                    for old_payload, result in zip(prompt_payloads, validation_results):
+                        apply_rollout_result_to_payload(
+                            old_payload,
+                            result,
+                            include_completed_conversations=(
+                                result.completed_conversations is not None
+                            ),
+                        )
                         validation_payloads.append(old_payload)
 
                     self.reward_dispatcher.enqueue_rewards_cal(
@@ -398,43 +414,50 @@ class TRTLLMRolloutWrapper(TRTLLMRolloutWorkerBase):
                 payloads: List[RLPayload] = self._prompt_queue.get()
                 logger.debug(f"[Rollout] generate start for prompts: {payloads}")
 
-                completions: List[List[str]] = self.rollout.rollout_generation(
+                generated = self.rollout.rollout_generation(
                     payloads=payloads,
                     data_packer=self.data_packer,
                     data_fetcher=self.data_fetcher,
                     sampling_params=self.sampling_params,
                 )
 
-                logger.debug(
-                    f"[Rollout] completions[-1][-1] of {len(completions[-1])} completions from trtllm: {completions[-1][-1]}"
-                )
+                rollout_results = normalize_rollout_results(generated)
+                if rollout_results and rollout_results[-1].completions:
+                    logger.debug(
+                        "[Rollout] completions[-1][-1] of %d completions from "
+                        "trtllm: %s",
+                        len(rollout_results[-1].completions),
+                        rollout_results[-1].completions[-1],
+                    )
 
-                # Remove empty completions
-                valid_completions: List[List[str]] = []
+                # Remove empty completions while preserving every producer field
+                # aligned with the same completion indices.  TRT-LLM's built-in
+                # producer returns RolloutResult, while accepting the historical
+                # List[List[str]] shape keeps custom backends backward compatible.
+                valid_results: List[RolloutResult] = []
                 prompt_indices_to_remove: List[int] = []
-                if len(completions):
+                if rollout_results:
                     batch_size = len(payloads)
+                    if len(rollout_results) != batch_size:
+                        raise ValueError(
+                            "[Rollout] TRT-LLM must return one result per prompt: "
+                            f"got {len(rollout_results)} results for {batch_size} prompts"
+                        )
                     for i in range(batch_size):
-                        completion = completions[i]
-                        skip_output = False
-                        total_generation_count = len(completion)
-                        empty_generation_count = 0
-                        output_texts = []
-                        for j in range(total_generation_count):
-                            output_text = completion[j]
+                        result = rollout_results[i]
+                        valid_indices = []
+                        for j, output_text in enumerate(result.completions):
                             if output_text == "":
                                 logger.warning(
                                     f"[Rollout] Got empty completion for {i}th prompt {j}th generation"
                                 )
-                                empty_generation_count += 1
                             else:
-                                output_texts.append(output_text)
+                                valid_indices.append(j)
                         # Skip the output if there is one or zero non-empty completions
-                        skip_output = (
-                            total_generation_count - empty_generation_count
-                        ) <= 1
-                        if not skip_output:
-                            valid_completions.append(output_texts)
+                        if len(valid_indices) > 1:
+                            valid_results.append(
+                                select_rollout_result_completions(result, valid_indices)
+                            )
                         else:
                             prompt_indices_to_remove.append(i)
                 if len(prompt_indices_to_remove):
@@ -443,19 +466,25 @@ class TRTLLMRolloutWrapper(TRTLLMRolloutWorkerBase):
                         for i, payload in enumerate(payloads)
                         if i not in prompt_indices_to_remove
                     ]
-                    assert len(payloads) == len(valid_completions), (
-                        "[Rollout] len(prompts) must be the same as len(valid_completions) after removing empty completions"
+                    assert len(payloads) == len(valid_results), (
+                        "[Rollout] len(prompts) must be the same as len(valid_results) after removing empty completions"
                     )
 
                 logger.debug("[Rollout] generate end!")
 
-                should_report = len(valid_completions) > 0
+                should_report = len(valid_results) > 0
 
                 if should_report:
                     # only the first tp rank in the rollout replica will post the completion to the controller.
                     valid_payloads = []
-                    for old_payload, completions in zip(payloads, valid_completions):
-                        old_payload.completions = completions
+                    for old_payload, result in zip(payloads, valid_results):
+                        apply_rollout_result_to_payload(
+                            old_payload,
+                            result,
+                            include_completed_conversations=(
+                                result.completed_conversations is not None
+                            ),
+                        )
                         valid_payloads.append(old_payload)
 
                     self.reward_dispatcher.enqueue_rewards_cal(

@@ -64,10 +64,7 @@ from cosmos_rl.dispatcher.data.packer.base import BaseDataPacker
 import cosmos_rl.utils.distributed as dist_util
 import cosmos_rl.utils.util as util
 from cosmos_rl.utils import constant
-from cosmos_rl.dispatcher.data.schema import (
-    RLPayload,
-    ConversationType,
-)
+from cosmos_rl.dispatcher.data.schema import RLPayload
 from cosmos_rl.rollout.worker.asynchronous.rollout_task_scheduler import (
     RolloutTaskScheduler,
     RolloutTask,
@@ -75,6 +72,13 @@ from cosmos_rl.rollout.worker.asynchronous.rollout_task_scheduler import (
 )
 from cosmos_rl.rollout.schema import RolloutResult
 from cosmos_rl.reward.dispatcher import RewardDispatcher
+from cosmos_rl.reward.admission import (
+    apply_rollout_result_to_payload,
+    consume_completion_admission_metrics,
+    DISCARDED_WEIGHT_VERSION_KEY,
+    prepare_completion_admission_report,
+    select_rollout_result_completions,
+)
 from cosmos_rl.dispatcher.data.data_fetcher import WorkerDataFetcher
 from cosmos_rl.collective.collective import P2RCollectiveManager
 from cosmos_rl.rollout.worker.weight_sync import (
@@ -88,6 +92,7 @@ from cosmos_rl.rollout.worker.weight_sync import (
     do_nccl_broadcast_tensors,
     install_inference_sync,
 )
+
 
 """
 Keep in mind that torch distributed is not thread safe. So try to keep the usage in the same thread.
@@ -1178,6 +1183,8 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
             if rollout_results:
                 for p, rr in zip(payloads_list, rollout_results):
                     p.completions = rr.completions
+                    p.completion_trainable = rr.completion_trainable
+                    p.completion_drop_reasons = rr.completion_drop_reasons
                     p.completion_logprobs = rr.completion_logprobs
                     p.completion_token_ids = rr.completion_token_ids
                     p.prompt_logprobs = rr.prompt_logprobs
@@ -2021,7 +2028,11 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                 if is_validation:
                     break
 
-                metadata = {}
+                payloads, metadata = consume_completion_admission_metrics(payloads)
+                metadata = prepare_completion_admission_report(
+                    metadata,
+                    step,
+                )
                 if self.config.train.train_policy.variant == "dapo":
                     payloads, metadata_from_dapo = self.dynamic_sampling(payloads)
                     metadata.update(metadata_from_dapo)
@@ -2397,11 +2408,15 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                         self.send_end_signal()
         logger.info(f"[Rollout] Main loop of {self.replica_name} finished")
 
-    def _report_discarded_samples(self, count: int) -> None:
+    def _report_discarded_samples(
+        self, count: int, weight_version: Optional[int] = None
+    ) -> None:
         """Report fetched samples that terminated without trainable results."""
         if count <= 0 or not self.should_report:
             return
 
+        if weight_version is None:
+            weight_version = self.current_weight_version
         report_id = uuid.uuid4().hex
         response = RolloutRequest(
             src_replica_name=self.replica_name,
@@ -2410,6 +2425,7 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
             metrics={
                 "discarded_samples": count,
                 "discard_report_id": report_id,
+                DISCARDED_WEIGHT_VERSION_KEY: weight_version,
             },
             is_end=False,
         )
@@ -2431,27 +2447,50 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         # we need filter the result with valid completions or valid completed_conversations
         valid_result: List[RolloutResult] = []
         valid_payloads_list: List[RLPayload] = []
+        partially_discarded_samples: Optional[int] = None
         if self.config.train.non_text:
             for payload, rr in zip(payloads_list, rollout_results):
                 if rr.completions is not None and len(rr.completions) > 0:
                     valid_result.append(rr)
                     valid_payloads_list.append(payload)
         elif self.config.rollout.multi_turn_config.enable:
+            partially_discarded_samples = 0
             for payload, rr in zip(payloads_list, rollout_results):
-                valid_conversations: List[ConversationType] = []
-                # remove those result without valid assistant message
-                flag = False
-                for conversation in rr.completed_conversations:
-                    for msg in conversation:
-                        if msg.role == "assistant" and msg.content != "":
-                            flag = True
-                            break
-                    if flag:
-                        valid_conversations.append(conversation)
-                rr.completed_conversations = valid_conversations
-                if len(rr.completed_conversations) > 0:
-                    valid_result.append(rr)
-                    valid_payloads_list.append(payload)
+                original_size = len(rr.completions)
+                conversations = rr.completed_conversations or []
+                if len(conversations) != original_size:
+                    logger.warning(
+                        "[Rollout] Discarding misaligned multi-turn result: "
+                        "completions=%d completed_conversations=%d",
+                        original_size,
+                        len(conversations),
+                    )
+                    partially_discarded_samples += original_size
+                    continue
+
+                valid_indices = [
+                    index
+                    for index, conversation in enumerate(conversations)
+                    if any(
+                        msg.role == "assistant" and msg.content != ""
+                        for msg in conversation
+                    )
+                ]
+                partially_discarded_samples += original_size - len(valid_indices)
+                if not valid_indices:
+                    continue
+                try:
+                    selected_result = select_rollout_result_completions(
+                        rr, valid_indices
+                    )
+                except ValueError as exc:
+                    logger.warning(
+                        "[Rollout] Discarding malformed multi-turn result: %s", exc
+                    )
+                    partially_discarded_samples += len(valid_indices)
+                    continue
+                valid_result.append(selected_result)
+                valid_payloads_list.append(payload)
         else:
             # Remove empty completions
             for payload, rr in zip(payloads_list, rollout_results):
@@ -2486,7 +2525,9 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                     valid_payloads_list.append(payload)
 
         self._report_discarded_samples(
-            (len(payloads_list) - len(valid_payloads_list))
+            partially_discarded_samples
+            if partially_discarded_samples is not None
+            else (len(payloads_list) - len(valid_payloads_list))
             * self.config.rollout.n_generation
         )
 
@@ -2495,17 +2536,14 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
             valid_payloads: List[RLPayload] = []
             # only the first tp rank in the rollout replica will post the completion to the controller.
             for old_payload, result in zip(valid_payloads_list, valid_result):
-                # update payload
-                old_payload.completions = result.completions
-                old_payload.completion_logprobs = result.completion_logprobs
-                old_payload.completion_token_ids = result.completion_token_ids
-                old_payload.prompt_logprobs = result.prompt_logprobs
-                old_payload.prompt_token_ids = result.prompt_token_ids
+                apply_rollout_result_to_payload(
+                    old_payload,
+                    result,
+                    include_completed_conversations=(
+                        self.config.rollout.multi_turn_config.enable
+                    ),
+                )
                 old_payload.weight_version = self.current_weight_version
-                old_payload.cumulative_logprob = result.cumulative_logprob
-                old_payload.extra_info = result.extra_info
-                if self.config.rollout.multi_turn_config.enable:
-                    old_payload.completed_conversations = result.completed_conversations
                 if self.config.train.local_dataset:
                     old_payload.reference_answer = (
                         self.data_fetcher.query_reference_answer(

@@ -25,8 +25,14 @@ from typing import List, Optional, Callable, Tuple
 import torch
 
 from cosmos_rl.dispatcher.data.schema import RLPayload
+from cosmos_rl.dispatcher.algo.base import REGISTERED_ALGOs
 from cosmos_rl.dispatcher.data.packer import BaseDataPacker
 from cosmos_rl.policy.config import Config
+from cosmos_rl.reward.admission import (
+    aggregate_excluded_reward_metrics,
+    resolve_completion_admission,
+    select_payload_completions,
+)
 from cosmos_rl.utils.logging import logger
 from cosmos_rl.utils.network_util import make_request_with_retry
 
@@ -72,6 +78,12 @@ class RemoteRewardCalculator:
             return
         self.train_config = config.train.train_policy.remote_reward
         self.val_config = config.validation.remote_reward
+        self.rl_algo = REGISTERED_ALGOs[config.train.train_policy.algo](
+            reward_fn=None,
+            unbiased=config.train.train_policy.unbiased_advantage,
+            config=config,
+        )
+        self.minimum_trainable_completions = self.rl_algo.minimum_trainable_completions
         # We use wan2pt1 VAE tokenizer to encode the images/videos into latents.
         try:
             self.tokenizer = Wan2pt1VAEInterface(
@@ -417,20 +429,84 @@ class RemoteRewardCalculator:
         payload_list: List[RLPayload] = []
         for i, payload in enumerate(valid_payloads):
             rewards = valid_results[i]
-            # Compute advantages (normalize rewards)
-            advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
-            # Handle NaN advantages
-            if torch.isnan(advantages).any():
-                advantages = torch.zeros_like(advantages)
-            # Create a new RLPayload with the reward
-            new_payload = RLPayload(
-                prompt=payload.prompt,
-                prompt_idx=payload.prompt_idx,
-                completions=payload.completions,
-                rewards=rewards.tolist(),
-                advantages=advantages.tolist(),
-                extra_info=payload.extra_info,
+            admission = resolve_completion_admission(
+                payload,
+                self.minimum_trainable_completions,
+                enabled=not is_validation,
             )
-            payload_list.append(new_payload)
+            if admission.explicit:
+                selected_payload = select_payload_completions(payload, admission)
+                training_excluded_indices = (
+                    range(admission.original_size)
+                    if admission.group_excluded
+                    else admission.excluded_indices
+                )
+                excluded_reward_metrics = aggregate_excluded_reward_metrics(
+                    {"reward": rewards[index].item()}
+                    for index in training_excluded_indices
+                )
+                if excluded_reward_metrics:
+                    if selected_payload.completion_admission_metrics is None:
+                        selected_payload.completion_admission_metrics = {}
+                    selected_payload.completion_admission_metrics.update(
+                        excluded_reward_metrics
+                    )
+            else:
+                # Keep the pre-admission remote-reward output contract exact for
+                # producers that do not opt into the new fields.
+                selected_payload = RLPayload(
+                    prompt=payload.prompt,
+                    prompt_idx=payload.prompt_idx,
+                    completions=payload.completions,
+                    extra_info=payload.extra_info,
+                )
+            if admission.excluded_indices:
+                logger.debug(
+                    "[CompletionAdmission] Excluding remote-reward completions "
+                    "from prompt_idx=%s: indices=%s reasons=%s rewards=%s",
+                    payload.prompt_idx,
+                    admission.excluded_indices,
+                    admission.drop_reason_counts,
+                    rewards[admission.excluded_indices].tolist(),
+                )
+            if admission.group_excluded:
+                selected_payload.rewards = []
+                selected_payload.advantages = []
+                selected_payload.filter_rewards = []
+                selected_payload.report_metrics = []
+                selected_payload.valid = False
+                payload_list.append(selected_payload)
+                logger.info(
+                    "[CompletionAdmission] Excluding remote-reward prompt_idx=%s "
+                    "group from training: original_size=%d eligible_size=%d "
+                    "minimum=%d excluded=%d reasons=%s",
+                    payload.prompt_idx,
+                    admission.original_size,
+                    admission.eligible_size,
+                    admission.minimum_trainable_completions,
+                    len(admission.excluded_indices),
+                    admission.drop_reason_counts,
+                )
+                continue
+
+            if admission.explicit:
+                rewards = rewards[admission.eligible_indices]
+                advantages = self.rl_algo.compute_advantage(rewards.tolist())
+                assert len(advantages) == len(rewards), (
+                    "[RemoteRewardCalculator] The length of advantages should be "
+                    "the same as the number of admitted completions"
+                )
+            else:
+                # Preserve the historical remote-reward contract when a
+                # producer does not opt into admission (and during validation).
+                # Explicit admission uses the selected algorithm above.
+                legacy_advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
+                if torch.isnan(legacy_advantages).any():
+                    legacy_advantages = torch.zeros_like(legacy_advantages)
+                advantages = legacy_advantages.tolist()
+            # Create a new RLPayload with the reward
+            selected_payload.rewards = rewards.tolist()
+            selected_payload.advantages = list(advantages)
+            payload_list.append(selected_payload)
 
         return payload_list, is_validation, step

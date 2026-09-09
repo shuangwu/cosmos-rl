@@ -283,9 +283,40 @@ srun \
 
     python -c "import cosmos_rl; print(f\"cosmos_rl location: {cosmos_rl.__file__}\"); print(f\"cosmos_rl version: {cosmos_rl.__version__}\")" 2>/dev/null || true
 
+    materialize_mounted_version_module() {
+        local repo_root="$1"
+        local target="${repo_root}/cosmos_rl/_version.py"
+        local installed_version_file
+        local temporary_target
+
+        # setuptools-scm generates this ignored file when the package is built.
+        # A raw checkout mounted over the installed package does not contain it,
+        # so preserve the generated module from the image before PYTHONPATH
+        # makes the checkout authoritative.
+        if [[ -f "${target}" ]]; then
+            return 0
+        fi
+        if ! installed_version_file="$(python -c "import sys; from pathlib import Path; matches = [candidate for entry in sys.path if (candidate := Path(entry) / \"cosmos_rl\" / \"_version.py\").is_file()]; print(matches[0] if matches else \"\"); raise SystemExit(not matches)")"; then
+            echo "ERROR: mounted repo lacks cosmos_rl/_version.py and no installed generated version module was found" >&2
+            return 1
+        fi
+
+        temporary_target="${target}.tmp.$$"
+        if ! cp "${installed_version_file}" "${temporary_target}"; then
+            echo "ERROR: failed to copy generated version module from ${installed_version_file}" >&2
+            return 1
+        fi
+        if ! mv "${temporary_target}" "${target}"; then
+            echo "ERROR: failed to install generated version module at ${target}" >&2
+            return 1
+        fi
+        echo "Materialized generated version module at ${target}"
+    }
+
     if [[ -d /opt/cosmos-rl/tests ]]; then
         # --repo-root-path was mounted: override the baked-in code/tests and run
         # against the working-tree copy (PYTHONPATH shadows the installed pkg).
+        materialize_mounted_version_module /opt/cosmos-rl || exit 1
         export PYTHONPATH="/opt/cosmos-rl:${PYTHONPATH}"
         cd /opt/cosmos-rl
         echo "Using mounted repo at /opt/cosmos-rl (overrides baked-in)"

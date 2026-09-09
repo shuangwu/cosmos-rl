@@ -18,8 +18,13 @@ from typing import List, Optional, Callable, Tuple
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 
 from cosmos_rl.dispatcher.data.schema import RLPayload
+from cosmos_rl.dispatcher.algo.base import REGISTERED_ALGOs
 from cosmos_rl.dispatcher.data.packer import BaseDataPacker
 from cosmos_rl.policy.config import Config
+from cosmos_rl.reward.admission import (
+    resolve_completion_admission,
+    select_payload_completions,
+)
 from cosmos_rl.reward.remote_calculator import RemoteRewardCalculator
 from cosmos_rl.reward.local_calculator import LocalRewardCalculator
 
@@ -58,6 +63,9 @@ class RewardDispatcher:
         """
 
         self.is_remote = config.train.train_policy.use_remote_reward
+        self.minimum_trainable_completions = REGISTERED_ALGOs[
+            config.train.train_policy.algo
+        ].minimum_trainable_completions
         if self.is_remote:
             self.remote_batch_size = config.train.train_policy.remote_reward.batch_size
 
@@ -151,7 +159,10 @@ class RewardDispatcher:
         if bypass_reward:
             for i in range(0, len(payloads), self.payload_per_task):
                 # Directly return the payloads with zero rewards and advantages
-                for payload in payloads[i : i + self.payload_per_task]:
+                for payload_idx in range(
+                    i, min(i + self.payload_per_task, len(payloads))
+                ):
+                    payload = payloads[payload_idx]
                     payload.rewards = [0.0 for _ in payload.completions]
                     payload.advantages = [0.0 for _ in payload.completions]
                     payload.filter_rewards = [0.0 for _ in payload.completions]
@@ -172,6 +183,16 @@ class RewardDispatcher:
                         payload.n_ignore_prefix_tokens = [
                             0 for _ in payload.completions
                         ]
+                    admission = resolve_completion_admission(
+                        payload,
+                        self.minimum_trainable_completions,
+                        enabled=not is_validation,
+                    )
+                    payloads[payload_idx] = select_payload_completions(
+                        payload, admission
+                    )
+                    if admission.group_excluded:
+                        payloads[payload_idx].valid = False
                 self.task_queue.put(
                     (
                         payloads[i : i + self.payload_per_task],

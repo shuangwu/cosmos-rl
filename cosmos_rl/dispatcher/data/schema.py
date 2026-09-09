@@ -87,6 +87,22 @@ class RLPayload(BaseModel):
         description="The original input conversation for the rollout, In multi-turn conversation, it is a list of conversation history for each turn.",
     )
 
+    completion_trainable: Optional[List[bool]] = Field(
+        default=None,
+        description="Whether each completion may be used for training. None admits every completion for backward compatibility.",
+    )
+
+    completion_drop_reasons: Optional[List[Optional[str]]] = Field(
+        default=None,
+        description="Optional stable, machine-readable producer reason for excluding each completion from training. Unknown values are grouped under 'other' in metrics.",
+    )
+
+    completion_admission_metrics: Optional[Dict[str, Union[int, float]]] = Field(
+        default=None,
+        exclude=True,
+        description="Internal group-level completion-admission counters consumed by the rollout worker.",
+    )
+
     n_ignore_prefix_tokens: Optional[List[int]] = Field(
         default=None,
         description="The number of prefix tokens to ignore when computing reward.",

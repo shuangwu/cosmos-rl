@@ -21,6 +21,8 @@ REGISTERED_ALGOs = {}
 
 
 class RuleBasedAlgo(ABC):
+    minimum_trainable_completions = 1
+
     def __init__(self, config: Any = None, **kwargs):
         """Store the run config so an algo can read its own settings.
 

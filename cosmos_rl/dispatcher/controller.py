@@ -146,6 +146,13 @@ class Controller:
         )
         self.is_diffusers = self.config.policy.is_diffusers
         self.weight_version_to_prompt_num = {}  # Only for on-policy.
+        # Completion-level rejection can leave an on-policy step short after
+        # its normal prompt quota has already been issued.  Credits reopen
+        # prompt slots for that same weight version without erasing the total
+        # attempt count used by max_retry_for_on_policy.
+        self.weight_version_to_replacement_prompt_num: Dict[int, int] = {}
+        self.weight_version_to_replacement_prompt_issued: Dict[int, int] = {}
+        self.weight_version_to_discarded_sample_num: Dict[int, int] = {}
 
         self.data_fetcher = ControllerDataFetcher(
             config=config,
@@ -291,6 +298,101 @@ maxmemory-policy allkeys-lfu
         return await self._get_batched_prompt_impl(n, validation_step, rank_in_mesh)
 
     _SOFT_THROTTLE_HEARTBEAT_S = 5.0
+
+    def register_discarded_samples_for_refill(
+        self, weight_version: int, discarded_samples: int
+    ) -> int:
+        """Reopen same-weight prompt capacity after terminal sample loss.
+
+        Prompt quotas are counted in prompts while discard reports are counted
+        in generated completions.  One replacement prompt can replenish up to
+        ``n_generation`` discarded completions; any surplus completions are
+        handled by the existing staleness filter after the current step fills.
+        """
+
+        train_policy = self.config.train.train_policy
+        if (
+            discarded_samples <= 0
+            or not getattr(train_policy, "on_policy", False)
+            or train_policy.variant == "dapo"
+            or self.config.mode == "colocated"
+        ):
+            return 0
+        if type(weight_version) is not int or weight_version < 0:
+            logger.warning(
+                "[Controller] Ignoring discarded-sample refill without a valid "
+                "weight version: version=%r count=%d",
+                weight_version,
+                discarded_samples,
+            )
+            return 0
+
+        credits = getattr(self, "weight_version_to_replacement_prompt_num", None)
+        if credits is None:
+            credits = self.weight_version_to_replacement_prompt_num = {}
+        issued = getattr(self, "weight_version_to_replacement_prompt_issued", None)
+        if issued is None:
+            issued = self.weight_version_to_replacement_prompt_issued = {}
+        discarded = getattr(self, "weight_version_to_discarded_sample_num", None)
+        if discarded is None:
+            discarded = self.weight_version_to_discarded_sample_num = {}
+
+        discarded[weight_version] = discarded.get(weight_version, 0) + discarded_samples
+        required_replacement_prompts = math.ceil(
+            discarded[weight_version] / self.config.rollout.n_generation
+        )
+        replacement_prompts = max(
+            0,
+            required_replacement_prompts
+            - issued.get(weight_version, 0)
+            - credits.get(weight_version, 0),
+        )
+        credits[weight_version] = credits.get(weight_version, 0) + replacement_prompts
+        logger.info(
+            "[Controller] Reopened %d replacement prompt slot(s) for weight "
+            "version %d after %d discarded completion(s)",
+            replacement_prompts,
+            weight_version,
+            discarded_samples,
+        )
+        return replacement_prompts
+
+    def _assign_prompt_weight_versions(
+        self,
+        payloads: List[RLPayload],
+        *,
+        starting_weight_version: int,
+        prompt_quota: int,
+    ) -> None:
+        """Assign prompt versions, consuming same-version refill credits first."""
+
+        weight_version = starting_weight_version
+        credits = getattr(self, "weight_version_to_replacement_prompt_num", None)
+        if credits is None:
+            credits = self.weight_version_to_replacement_prompt_num = {}
+        issued_replacements = getattr(
+            self, "weight_version_to_replacement_prompt_issued", None
+        )
+        if issued_replacements is None:
+            issued_replacements = self.weight_version_to_replacement_prompt_issued = {}
+        for payload in payloads:
+            while True:
+                refill_credit = credits.get(weight_version, 0)
+                issued = self.weight_version_to_prompt_num.get(weight_version, 0)
+                if refill_credit > 0:
+                    credits[weight_version] = refill_credit - 1
+                    issued_replacements[weight_version] = (
+                        issued_replacements.get(weight_version, 0) + 1
+                    )
+                    break
+                if issued < prompt_quota:
+                    break
+                weight_version += 1
+
+            payload.weight_version = weight_version
+            self.weight_version_to_prompt_num[weight_version] = (
+                self.weight_version_to_prompt_num.get(weight_version, 0) + 1
+            )
 
     def _update_soft_throttle_state(
         self,
@@ -516,41 +618,11 @@ maxmemory-policy allkeys-lfu
             )
             current_fetch_count = len(payloads_list)
             if self.config.train.train_policy.variant != "dapo":
-                weight_version_for_each_payload = weight_version_for_current_batch
-                for payload in payloads_list:
-                    # Fully Synchronized mode is enabled and no dapo variant, we need to ensure that for each weight version, we fetch exactly global_batch_size prompts.
-                    while (
-                        weight_version_for_each_payload
-                        in self.weight_version_to_prompt_num
-                        and self.weight_version_to_prompt_num[
-                            weight_version_for_each_payload
-                        ]
-                        >= global_batch_size
-                    ):
-                        assert (
-                            self.weight_version_to_prompt_num[
-                                weight_version_for_each_payload
-                            ]
-                            == global_batch_size
-                        ), (
-                            f"[Controller] For weight version {weight_version_for_each_payload}, the number of fetched prompts {self.weight_version_to_prompt_num[weight_version_for_each_payload]} exceeds the global batch size {global_batch_size}."
-                        )
-                        weight_version_for_each_payload += 1
-                    # record the number of valid prompts for each weight version
-                    # tag the payload with the corresponding weight version
-                    if (
-                        weight_version_for_each_payload
-                        not in self.weight_version_to_prompt_num
-                    ):
-                        payload.weight_version = weight_version_for_each_payload
-                        self.weight_version_to_prompt_num[
-                            weight_version_for_each_payload
-                        ] = 1
-                    else:
-                        payload.weight_version = weight_version_for_each_payload
-                        self.weight_version_to_prompt_num[
-                            weight_version_for_each_payload
-                        ] += 1
+                self._assign_prompt_weight_versions(
+                    payloads_list,
+                    starting_weight_version=weight_version_for_current_batch,
+                    prompt_quota=global_batch_size,
+                )
             else:
                 # record the number of valid prompts for current weight version
                 if (

@@ -35,6 +35,14 @@ class RolloutResult(BaseModel):
     # The generated conversation history for the prompt.
     completed_conversations: Optional[List[ConversationType]] = None
 
+    # Whether each completion may be used for training.  None preserves the
+    # historical behavior and admits every completion.
+    completion_trainable: Optional[List[bool]] = None
+
+    # Optional stable, machine-readable producer reason for excluding each
+    # completion. Unknown reason values are grouped under "other" in metrics.
+    completion_drop_reasons: Optional[List[Optional[str]]] = None
+
     # The logprobs of the generated completions consider top_k tokens
     completion_logprobs: Optional[List[List[List[float]]]] = None
 
