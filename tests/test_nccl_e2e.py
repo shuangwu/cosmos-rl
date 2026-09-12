@@ -66,29 +66,34 @@ def _make_trajectory(device, ep_len=8, obs_dim=4, action_dim=2):
     }
 
 
-def _make_strided_trajectory(device, ep_len=8, obs_dim=4):
-    """Trajectory whose ``actions`` field has a non-unit last stride.
+#: Extra schema field for the strided case, mirroring the per-generation
+#: sampled-mode column an NDAS producer emits.
+STRIDED_FIELD = "sampled_mode"
+STRIDED_VALUE = 3
 
-    ``actions`` is a ``(ep_len, 1)`` view carrying stride ``(1, ep_len)``.  A
-    size-1 dimension may hold any stride, so PyTorch calls this contiguous and
-    ``.contiguous()`` leaves it alone -- yet ``view(torch.uint8)`` rejects it.
-    Producers emit exactly this shape when they slice one column out of a
-    per-generation tensor, and before the packer materialized canonical
-    storage the whole payload silently fell back off the NCCL path.
+
+def _strided_scalar(device):
+    """``shape=(1,)`` int64 whose last stride is 8, yet reports contiguous.
+
+    A size-1 dimension may hold any stride, so ``.contiguous()`` leaves this
+    untouched and ``view(torch.uint8)`` then rejects it.  Producers emit
+    exactly this when they slice one column out of a per-generation tensor.
     """
-    base = torch.arange(ep_len * 2, dtype=torch.float32, device=device).reshape(
-        2, ep_len
-    )
-    actions = base.t()[:, :1]
-    assert actions.is_contiguous() and actions.stride(-1) != 1
-    return {
-        "observations": torch.arange(
-            ep_len * obs_dim, dtype=torch.float32, device=device
-        ).reshape(ep_len, obs_dim),
-        "actions": actions,
-        "rewards": torch.arange(ep_len, dtype=torch.float32, device=device),
-        "episode_length": ep_len,
-    }
+    row = torch.arange(8, dtype=torch.int64, device=device).reshape(1, 8)
+    value = row[:, STRIDED_VALUE]
+    assert value.is_contiguous() and value.stride(-1) != 1
+    return value
+
+
+def _make_strided_trajectory(device, ep_len=8, obs_dim=4, action_dim=2):
+    """The ordinary trajectory plus one field with a non-unit last stride.
+
+    Dims stay exactly as the passing roundtrips use them: the stride is the
+    only variable, so a failure here cannot be blamed on an unusual schema.
+    """
+    traj = _make_trajectory(device, ep_len, obs_dim, action_dim)
+    traj[STRIDED_FIELD] = _strided_scalar(device)
+    return traj
 
 
 def _worker(
@@ -120,14 +125,30 @@ def _worker(
         client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
         config = _Config()
-        # A strided run declares action_dim=1: the offending layout needs a
-        # size-1 trailing dimension, which is what lets a non-unit stride
-        # survive the contiguity check.
-        dims = dict(max_steps=8, obs_dim=4, action_dim=1 if strided else 2)
+        dims = dict(max_steps=8, obs_dim=4, action_dim=2)
         build = _make_strided_trajectory if strided else _make_trajectory
 
         if rank == 0:
             # Producer.
+            if strided:
+                # Extend the schema the way a backend does -- before setup, so
+                # the mixin sizes its buffers from it.  The consumer needs no
+                # change: the producer ships the schema in its metadata.
+                import numpy as np
+
+                import cosmos_rl.utils.payload_transport.nccl.mixins as _mixins
+                from cosmos_rl.utils.trajectory import TensorSpec
+
+                _base_build = _mixins.build_trajectory_schema
+
+                def _build_with_strided_field(dims_arg):
+                    schema = _base_build(dims_arg)
+                    schema.append(
+                        TensorSpec(name=STRIDED_FIELD, shape=(1,), dtype=np.int64)
+                    )
+                    return schema
+
+                _mixins.build_trajectory_schema = _build_with_strided_field
             producer = NCCLRolloutMixin()
             producer.setup_nccl(
                 replica_id="rollout-0",
@@ -196,10 +217,10 @@ def _worker(
             if strided:
                 # The point of the strided run: the non-unit-stride field must
                 # arrive intact rather than taking the pack fallback.
-                actions = resolved["actions"].float().reshape(-1)
-                assert torch.allclose(
-                    actions, expected_traj["actions"].float().reshape(-1)
-                ), "strided field mismatch"
+                got = resolved[STRIDED_FIELD].reshape(-1)[0].item()
+                assert got == STRIDED_VALUE, (
+                    "strided field mismatch: got %r want %r" % (got, STRIDED_VALUE)
+                )
             client.set(done_key, "1")
             if composed:
                 # No transport-specific teardown to call: shutdown_prefetch
