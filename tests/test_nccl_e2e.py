@@ -31,6 +31,7 @@ existing instance with ``COSMOS_TEST_REDIS_HOST`` / ``COSMOS_TEST_REDIS_PORT``.
 
 import json
 import os
+import uuid
 import time
 import unittest
 
@@ -96,8 +97,17 @@ def _worker(
     err_queue,
     composed: bool = False,
     strided: bool = False,
+    run_id: str = "",
 ):
-    """Entry point for each spawned rank.  Reports failures via err_queue."""
+    """Entry point for each spawned rank.  Reports failures via err_queue.
+
+    ``run_id`` namespaces the Redis keys.  Module-level keys let a producer
+    that outlived its own test -- it serves for up to 60s -- be picked up by
+    the next test in the session, which then hangs waiting on a peer that is
+    already tearing down.  One namespace per roundtrip removes that coupling.
+    """
+    meta_key = "%s:%s" % (_META_KEY, run_id) if run_id else _META_KEY
+    done_key = "%s:%s" % (_DONE_KEY, run_id) if run_id else _DONE_KEY
     try:
         import redis
 
@@ -131,10 +141,10 @@ def _worker(
             traj = build(device)
             meta = producer.write_to_buffer(traj)
             assert meta is not None, "producer failed to pack buffer"
-            client.set(_META_KEY, json.dumps(meta))
+            client.set(meta_key, json.dumps(meta))
             # Serve until the consumer signals completion (bounded).
             deadline = time.monotonic() + 60
-            while time.monotonic() < deadline and not client.get(_DONE_KEY):
+            while time.monotonic() < deadline and not client.get(done_key):
                 time.sleep(0.05)
             producer.cleanup_nccl()
         else:
@@ -170,7 +180,7 @@ def _worker(
             raw = None
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline and raw is None:
-                raw = client.get(_META_KEY)
+                raw = client.get(meta_key)
                 if raw is None:
                     time.sleep(0.05)
             assert raw is not None, "consumer never saw producer metadata"
@@ -190,7 +200,7 @@ def _worker(
                 assert torch.allclose(
                     actions, expected_traj["actions"].float().reshape(-1)
                 ), "strided field mismatch"
-            client.set(_DONE_KEY, "1")
+            client.set(done_key, "1")
             if composed:
                 # No transport-specific teardown to call: shutdown_prefetch
                 # defaults before_join to the attached strategy, which is the
@@ -322,10 +332,16 @@ class TestNcclE2E(unittest.TestCase):
     def _run_roundtrip(self, composed: bool, strided: bool = False):
         import torch.multiprocessing as mp
 
+        # One Redis namespace per roundtrip: a producer serves for up to 60s,
+        # so with shared keys it can outlive its own test and be picked up by
+        # the next one, which then waits on a peer that is tearing down.
+        run_id = uuid.uuid4().hex[:8]
         ctx = mp.get_context("spawn")
         err_queue = ctx.Queue()
         procs = [
-            ctx.Process(target=_worker, args=(rank, 2, err_queue, composed, strided))
+            ctx.Process(
+                target=_worker, args=(rank, 2, err_queue, composed, strided, run_id)
+            )
             for rank in range(2)
         ]
         for p in procs:
