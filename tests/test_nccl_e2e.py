@@ -65,7 +65,38 @@ def _make_trajectory(device, ep_len=8, obs_dim=4, action_dim=2):
     }
 
 
-def _worker(rank: int, world_size: int, err_queue, composed: bool = False):
+def _make_strided_trajectory(device, ep_len=8, obs_dim=4):
+    """Trajectory whose ``actions`` field has a non-unit last stride.
+
+    ``actions`` is a ``(ep_len, 1)`` view carrying stride ``(1, ep_len)``.  A
+    size-1 dimension may hold any stride, so PyTorch calls this contiguous and
+    ``.contiguous()`` leaves it alone -- yet ``view(torch.uint8)`` rejects it.
+    Producers emit exactly this shape when they slice one column out of a
+    per-generation tensor, and before the packer materialized canonical
+    storage the whole payload silently fell back off the NCCL path.
+    """
+    base = torch.arange(ep_len * 2, dtype=torch.float32, device=device).reshape(
+        2, ep_len
+    )
+    actions = base.t()[:, :1]
+    assert actions.is_contiguous() and actions.stride(-1) != 1
+    return {
+        "observations": torch.arange(
+            ep_len * obs_dim, dtype=torch.float32, device=device
+        ).reshape(ep_len, obs_dim),
+        "actions": actions,
+        "rewards": torch.arange(ep_len, dtype=torch.float32, device=device),
+        "episode_length": ep_len,
+    }
+
+
+def _worker(
+    rank: int,
+    world_size: int,
+    err_queue,
+    composed: bool = False,
+    strided: bool = False,
+):
     """Entry point for each spawned rank.  Reports failures via err_queue."""
     try:
         import redis
@@ -79,7 +110,11 @@ def _worker(rank: int, world_size: int, err_queue, composed: bool = False):
         client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
         config = _Config()
-        dims = dict(max_steps=8, obs_dim=4, action_dim=2)
+        # A strided run declares action_dim=1: the offending layout needs a
+        # size-1 trailing dimension, which is what lets a non-unit stride
+        # survive the contiguity check.
+        dims = dict(max_steps=8, obs_dim=4, action_dim=1 if strided else 2)
+        build = _make_strided_trajectory if strided else _make_trajectory
 
         if rank == 0:
             # Producer.
@@ -93,7 +128,7 @@ def _worker(rank: int, world_size: int, err_queue, composed: bool = False):
                 device=device,
                 **dims,
             )
-            traj = _make_trajectory(device)
+            traj = build(device)
             meta = producer.write_to_buffer(traj)
             assert meta is not None, "producer failed to pack buffer"
             client.set(_META_KEY, json.dumps(meta))
@@ -143,9 +178,18 @@ def _worker(rank: int, world_size: int, err_queue, composed: bool = False):
 
             resolved = packer.get_policy_input(rollout_output=meta)
             assert resolved is not None, "consumer failed to resolve NCCL ref"
+            expected_traj = build(device)
             obs = resolved["observations"]
-            expected = _make_trajectory(device)["observations"]
-            assert torch.allclose(obs.float(), expected), "payload mismatch"
+            assert torch.allclose(obs.float(), expected_traj["observations"]), (
+                "payload mismatch"
+            )
+            if strided:
+                # The point of the strided run: the non-unit-stride field must
+                # arrive intact rather than taking the pack fallback.
+                actions = resolved["actions"].float().reshape(-1)
+                assert torch.allclose(
+                    actions, expected_traj["actions"].float().reshape(-1)
+                ), "strided field mismatch"
             client.set(_DONE_KEY, "1")
             if composed:
                 # No transport-specific teardown to call: shutdown_prefetch
@@ -275,13 +319,13 @@ class TestNcclE2E(unittest.TestCase):
         for key in (_META_KEY, _DONE_KEY):
             self.client.delete(key)
 
-    def _run_roundtrip(self, composed: bool):
+    def _run_roundtrip(self, composed: bool, strided: bool = False):
         import torch.multiprocessing as mp
 
         ctx = mp.get_context("spawn")
         err_queue = ctx.Queue()
         procs = [
-            ctx.Process(target=_worker, args=(rank, 2, err_queue, composed))
+            ctx.Process(target=_worker, args=(rank, 2, err_queue, composed, strided))
             for rank in range(2)
         ]
         for p in procs:
@@ -311,6 +355,15 @@ class TestNcclE2E(unittest.TestCase):
         differently, the payload comes back wrong or not at all.
         """
         self._run_roundtrip(composed=True)
+
+    def test_two_rank_roundtrip_strided_field(self):
+        """A field with a non-unit last stride must survive the real transfer.
+
+        CPU tests cover the packer in isolation; this proves the same payload
+        packs, sends, and unpacks GPU->GPU instead of failing in
+        ``write_to_buffer`` and dropping the run to the disk fallback.
+        """
+        self._run_roundtrip(composed=False, strided=True)
 
 
 if __name__ == "__main__":
