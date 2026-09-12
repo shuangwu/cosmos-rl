@@ -103,6 +103,7 @@ def _worker(
     composed: bool = False,
     strided: bool = False,
     run_id: str = "",
+    action_dim: int = 2,
 ):
     """Entry point for each spawned rank.  Reports failures via err_queue.
 
@@ -125,8 +126,11 @@ def _worker(
         client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
         config = _Config()
-        dims = dict(max_steps=8, obs_dim=4, action_dim=2)
-        build = _make_strided_trajectory if strided else _make_trajectory
+        dims = dict(max_steps=8, obs_dim=4, action_dim=action_dim)
+
+        def build(dev):
+            fn = _make_strided_trajectory if strided else _make_trajectory
+            return fn(dev, action_dim=action_dim)
 
         if rank == 0:
             # Producer.
@@ -350,7 +354,9 @@ class TestNcclE2E(unittest.TestCase):
         for key in (_META_KEY, _DONE_KEY):
             self.client.delete(key)
 
-    def _run_roundtrip(self, composed: bool, strided: bool = False):
+    def _run_roundtrip(
+        self, composed: bool, strided: bool = False, action_dim: int = 2
+    ):
         import torch.multiprocessing as mp
 
         # One Redis namespace per roundtrip: a producer serves for up to 60s,
@@ -361,7 +367,8 @@ class TestNcclE2E(unittest.TestCase):
         err_queue = ctx.Queue()
         procs = [
             ctx.Process(
-                target=_worker, args=(rank, 2, err_queue, composed, strided, run_id)
+                target=_worker,
+                args=(rank, 2, err_queue, composed, strided, run_id, action_dim),
             )
             for rank in range(2)
         ]
@@ -392,6 +399,21 @@ class TestNcclE2E(unittest.TestCase):
         differently, the payload comes back wrong or not at all.
         """
         self._run_roundtrip(composed=True)
+
+    def test_two_rank_roundtrip_narrow_action_dim(self):
+        """A payload schema narrower than the consumer config must still resolve.
+
+        The consumer decodes from the schema the producer ships in its
+        metadata, so ``action_dim=1`` against a config declaring 2 should be
+        transparent.  When this shape was first tried the payload packed and
+        the consumer then dropped the reference inside ``_rendezvous_one``
+        within 18ms -- no bytes moved and the episode fell back to Redis.
+        Ordinary trajectory here, so only the dim differs: if this fails, the
+        consumer path is still sizing from config rather than from the
+        reference, and any backend whose schema differs loses payloads
+        silently.
+        """
+        self._run_roundtrip(composed=False, action_dim=1)
 
     def test_two_rank_roundtrip_strided_field(self):
         """A field with a non-unit last stride must survive the real transfer.
