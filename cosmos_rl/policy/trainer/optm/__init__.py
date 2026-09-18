@@ -230,6 +230,36 @@ class OptimizersContainer(Optimizer, Generic[T]):
                 for k, v in state_dict.items()
                 if k.startswith(f"idx-{i}-")
             }
+            # Adam initializes state lazily. A fused optimizer can have state
+            # for only the parameters that received gradients, while PyTorch's
+            # flattened restore expects state for every trainable parameter.
+            saved_params = {
+                k[len("state.") :].rsplit(".", 1)[0]
+                for k in current_state_dict
+                if k.startswith("state.")
+            }
+            grouped_params = {
+                k[len("param_groups.") :].rsplit(".", 1)[0]
+                for k in current_state_dict
+                if k.startswith("param_groups.")
+            }
+            missing_params = grouped_params - saved_params
+            if missing_params:
+                template = get_optimizer_state_dict(
+                    mp, opt, options=StateDictOptions(flatten_optimizer_state_dict=True)
+                )
+                for key, value in template.items():
+                    if (
+                        key.startswith("state.")
+                        and key[len("state.") :].rsplit(".", 1)[0] in missing_params
+                    ):
+                        # The template takes a zero-LR step to create slots;
+                        # reset its step counter too, so first use is step 1.
+                        current_state_dict[key] = (
+                            torch.zeros_like(value)
+                            if isinstance(value, torch.Tensor)
+                            else type(value)(0)
+                        )
             set_optimizer_state_dict(mp, opt, current_state_dict)
 
     def _post_init(

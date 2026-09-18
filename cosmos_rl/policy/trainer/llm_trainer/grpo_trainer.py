@@ -2058,6 +2058,10 @@ class GRPOTrainer(LLMTrainer):
                 model_loaded = True
                 logger.info("[Policy] Model loaded from checkpoint.")
             except Exception as e:
+                if isinstance(self.config.train.resume, str):
+                    # An explicit checkpoint must restore completely. Falling
+                    # back would combine fresh weights with resumed counters.
+                    raise
                 if isinstance(e, FileNotFoundError):
                     logger.info(
                         f"[Policy] Fail to resume from {self.config.train.resume} because the checkpoint file does not exist, trying to load from HuggingFace..."

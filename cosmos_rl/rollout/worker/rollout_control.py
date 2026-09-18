@@ -498,6 +498,10 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
             if self.scheduler is not None:
                 self.scheduler.stop(wait=False)
                 self.scheduler = None
+            else:
+                # The async scheduler owns engine shutdown; synchronous engines
+                # also need to release resources such as VLA simulator children.
+                self.rollout.shutdown()
 
             if self.heartbeat_thread is not None:
                 logger.info("[Rollout] handle_shutdown: joining heartbeat process")
