@@ -75,6 +75,12 @@ from cosmos_rl.utils.payload_transport.nccl.streams import (
     wait_event,
 )
 from cosmos_rl.utils.payload_transport.strategy import PayloadTransportStrategy
+from cosmos_rl.utils.payload_transport.receive_memory import (
+    ReceiveBudget,
+    ReceiveMemoryError,
+    ReceivedBatch,
+    storage_bytes,
+)
 from cosmos_rl.utils.trace import get_trace_time
 
 
@@ -123,6 +129,9 @@ class NCCLTransportStrategy(PayloadTransportStrategy):
     _last_bytes: int = 0
     _last_count: int = 0
     _steps: int = 0
+    _receive_budget = None
+    _bounded_fetch_lock = None
+    _decode_account = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -154,6 +163,18 @@ class NCCLTransportStrategy(PayloadTransportStrategy):
             recv_timeout: Per-``nccl_recv`` / per-rendezvous wall-clock
                 budget so a wedged sender engages retry / quarantine fast.
         """
+        custom = getattr(config, "custom", None) or {}
+        limit = custom.get("nccl_receive_budget_bytes", 0)
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("nccl_receive_budget_bytes must be a nonnegative integer")
+        self._receive_budget = (
+            ReceiveBudget(
+                limit, float(custom.get("nccl_receive_admission_timeout", 30.0))
+            )
+            if limit
+            else None
+        )
+        self._bounded_fetch_lock = threading.Lock()
         self._device = device
         self._redis = redis_client
         self._config = config
@@ -225,6 +246,8 @@ class NCCLTransportStrategy(PayloadTransportStrategy):
         parked on a departed peer would otherwise hold the join for the full
         first-transfer budget rather than the join timeout.
         """
+        if self._receive_budget is not None:
+            self._receive_budget.close()
         if self._comm_cache is not None:
             try:
                 self._comm_cache.abort_all()
@@ -282,6 +305,11 @@ class NCCLTransportStrategy(PayloadTransportStrategy):
             key = _cache_key_from_task(tasks, idx)
             cache_results[key] = gpu_data
 
+        if isinstance(results, ReceivedBatch):
+            results.clear()
+            results.update(cache_results)
+            cache_results = results
+
         self._last_bytes = total_bytes
         self._last_count = len(results)
         if results:
@@ -303,6 +331,11 @@ class NCCLTransportStrategy(PayloadTransportStrategy):
         crash the training step instead of degrading to the packer's fallback.
         Mirrors the UCXX consumer's sync-fallback contract.
         """
+        if self._receive_budget is not None:
+            raise ReceiveMemoryError(
+                "Bounded NCCL reception requires start_prefetch/wait_prefetch; "
+                "cache-miss refetch is disabled to preserve consumer leases."
+            )
         try:
             # Parse inside the guard too: a malformed dict ref (e.g. a corrupt
             # ``_schema``) raises from deserialize_schema, and this path has no
@@ -346,7 +379,95 @@ class NCCLTransportStrategy(PayloadTransportStrategy):
     # NCCL recv path
     # ------------------------------------------------------------------
 
+    def receive_memory_stats(self) -> dict:
+        return self._receive_budget.snapshot() if self._receive_budget else {}
+
     def _fetch_all(self, refs: List[Tuple[Any, dict]]) -> Tuple[dict, int, float]:
+        if self._receive_budget is None or not refs:
+            return self._fetch_unbounded(refs)
+        # Serial bounded fetches avoid racing raw attribution and duplicate
+        # reservations on the shared transfer stream. Admission precedes any
+        # rendezvous, so a sender never waits while we wait for consumer release.
+        with self._bounded_fetch_lock:
+            return self._fetch_bounded(refs)
+
+    def _fetch_bounded(self, refs):
+        budget = self._receive_budget
+        decoded_prefix = 0
+        required = 0
+        for _, ref in refs:
+            _, raw_size = schema_layout(ref["schema"])
+            decoded_size = sum(spec.nbytes for spec in ref["schema"])
+            decoded_prefix += decoded_size
+            required = max(required, decoded_prefix + HEADER_NBYTES + raw_size)
+        budget.reserve(required)
+        results = {}
+        part = {}
+        total_bytes = 0
+        t0 = get_trace_time()
+        failure = None
+        attributed = 0
+
+        def account_decode(nbytes):
+            nonlocal attributed
+            attributed += nbytes
+            budget.attribute(decoded=nbytes)
+
+        self._decode_account = account_decode
+        try:
+            for idx, ref in refs:
+                if budget.closed:
+                    raise ReceiveMemoryError("NCCL receive cancelled by shutdown")
+                # Each call fully completes its recv and drops every raw alias
+                # before the next payload is admitted. Keep the alignment clones.
+                part, nbytes, _ = self._fetch_unbounded([(idx, ref)])
+                if torch.cuda.is_available():
+                    torch.cuda.current_stream(self._device).synchronize()
+                results.update(part)
+                part.clear()
+                current = storage_bytes(results.values())
+                budget.attribute(decoded=current - attributed)
+                attributed = current
+                total_bytes += nbytes
+                budget.attribute(raw=-budget.raw)
+            actual = storage_bytes(results.values())
+            if actual > required:
+                raise ReceiveMemoryError("Decoded storage exceeded schema reservation")
+        except Exception as exc:
+            # Do not carry a traceback holding raw buffers/decoded tensors into
+            # the prefetch error queue. The recovery path already handles comms.
+            failure = f"{type(exc).__name__}: {exc}"
+            logger.error(
+                "[NCCLTransportStrategy] bounded receive failed: transfer=%s "
+                "schema=%s error=%s; %s",
+                ref["transfer_id"],
+                ref["schema"],
+                failure,
+                budget.snapshot(),
+            )
+        self._decode_account = None
+        if failure is not None:
+            # Outstanding decode copies must finish before their charge goes away.
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.current_stream(self._device).synchronize()
+                except Exception as exc:
+                    budget.close()
+                    raise ReceiveMemoryError(
+                        "CUDA completion failed; receive budget is closed and its "
+                        "reservation retained. Restart the receiver."
+                    ) from exc
+            results.clear()
+            part.clear()
+            budget.attribute(raw=-budget.raw, decoded=-attributed)
+            budget.release(required)
+            raise ReceiveMemoryError(failure)
+        budget.release(required - actual)
+        leased = ReceivedBatch(results, budget, actual)
+        logger.info("[NCCLTransportStrategy] receive memory: %s", budget.snapshot())
+        return leased, total_bytes, get_trace_time() - t0
+
+    def _fetch_unbounded(self, refs: List[Tuple[Any, dict]]) -> Tuple[dict, int, float]:
         """Rendezvous + ``nccl_recv``, interleaved per ref.
 
         Returns ``(results_by_idx, total_bytes, transfer_ms)``.  Each ref is
@@ -551,7 +672,12 @@ class NCCLTransportStrategy(PayloadTransportStrategy):
 
             for idx, ref, _comm_idx, recv_buf in posted:
                 try:
-                    gpu_data = _verify_and_unpack(recv_buf, ref, device)
+                    if self._decode_account is None:
+                        gpu_data = _verify_and_unpack(recv_buf, ref, device)
+                    else:
+                        gpu_data = _verify_and_unpack(
+                            recv_buf, ref, device, on_allocate=self._decode_account
+                        )
                 except PayloadHeaderMismatch as exc:
                     # The bytes we got belong to some OTHER transfer: this pair's
                     # send/recv stream is out of step.  Everything still queued on
@@ -728,6 +854,10 @@ class NCCLTransportStrategy(PayloadTransportStrategy):
                     return None
                 try:
                     recv_buf = _alloc_recv_buffer(ref["schema"], self._device)
+                    if self._receive_budget is not None:
+                        self._receive_budget.attribute(
+                            raw=recv_buf.untyped_storage().nbytes()
+                        )
                 except Exception as e:
                     # Never returned to the caller -> nothing will unpin it here.
                     cache.unpin(pair)
@@ -742,6 +872,14 @@ class NCCLTransportStrategy(PayloadTransportStrategy):
                         e,
                     )
                     self._resync_pair(cache, ref, reason="recv buffer alloc failed")
+                    if self._receive_budget is not None:
+                        logger.error(
+                            "NCCL allocation context: transfer=%s schema=%s budget=%s",
+                            transfer_id,
+                            ref["schema"],
+                            self.receive_memory_stats(),
+                        )
+                        raise
                     return None
                 return comm_idx, recv_buf
             if result.status is TransferStatus.MISSING:
@@ -921,7 +1059,9 @@ def _alloc_recv_buffer(schema: Optional[list], device: Any) -> torch.Tensor:
     return torch.empty(HEADER_NBYTES + entry_size, dtype=torch.uint8, device=device)
 
 
-def _verify_and_unpack(recv_buf: torch.Tensor, ref: dict, device: Any) -> dict:
+def _verify_and_unpack(
+    recv_buf: torch.Tensor, ref: dict, device: Any, *, on_allocate=None
+) -> dict:
     """Check the payload header, then slice the payload region by schema.
 
     The header is the only thing that ties the bytes in ``recv_buf`` to the
@@ -940,10 +1080,14 @@ def _verify_and_unpack(recv_buf: torch.Tensor, ref: dict, device: Any) -> dict:
     _, entry_size = schema_layout(schema)
     header = bytes(recv_buf[:HEADER_NBYTES].cpu().numpy())
     verify_header(header, transfer_id=ref["transfer_id"], payload_nbytes=entry_size)
-    return _unpack(recv_buf[HEADER_NBYTES:], schema, device)
+    if on_allocate is None:
+        return _unpack(recv_buf[HEADER_NBYTES:], schema, device)
+    return _unpack(recv_buf[HEADER_NBYTES:], schema, device, on_allocate=on_allocate)
 
 
-def _unpack(recv_buf: torch.Tensor, schema: Optional[list], device: Any) -> dict:
+def _unpack(
+    recv_buf: torch.Tensor, schema: Optional[list], device: Any, *, on_allocate=None
+) -> dict:
     """Slice a payload region (header already stripped) into schema tensors."""
     if schema is None:
         return {}
@@ -960,6 +1104,8 @@ def _unpack(recv_buf: torch.Tensor, schema: Optional[list], device: Any) -> dict
         # the wider dtype.  Cloning yields fresh storage at offset 0, which
         # is always aligned.  (Same reason UCXX clones before its view.)
         raw = recv_buf[off : off + spec.nbytes].clone()
+        if on_allocate is not None:
+            on_allocate(raw.untyped_storage().nbytes())
         out[spec.name] = raw.view(td).reshape(spec.shape)
     _truncate_to_episode_len(out)
     return out

@@ -84,6 +84,10 @@ from typing import Any, Callable, Dict, List, Optional
 
 from cosmos_rl.utils.logging import logger
 from cosmos_rl.utils.payload_transport.strategy import PayloadTransportStrategy
+from cosmos_rl.utils.payload_transport.receive_memory import (
+    ReceiveMemoryError,
+    ReceivedBatch,
+)
 from cosmos_rl.utils.trace import get_trace_time
 
 
@@ -123,6 +127,7 @@ class PrefetchDataPackerMixin:
     _prefetch_cache: Dict[str, Any] = {}
     _prefetch_timeout_s: float = 300.0
     _prefetch_step_count: int = 0
+    _prefetch_failure: Optional[str] = None
 
     # Double-buffer state for early-ack.  Owned here so any concrete
     # subclass gets it for free.
@@ -167,6 +172,14 @@ class PrefetchDataPackerMixin:
             )
         self._prefetch_thread = None
 
+        if (
+            isinstance(self._prefetch_cache, ReceivedBatch)
+            and not self._prefetch_cache.released
+        ):
+            raise ReceiveMemoryError(
+                "Release the previous consumer batch before restarting prefetch"
+            )
+        self._prefetch_failure = None
         self._prefetch_cache = {}
         self._prefetch_request_queue = queue.Queue()
         self._prefetch_result_queue = queue.Queue()
@@ -246,6 +259,16 @@ class PrefetchDataPackerMixin:
                 )
             else:
                 self._prefetch_thread = None
+        if (
+            thread is None or not thread.is_alive()
+        ) and self._prefetch_result_queue is not None:
+            while True:
+                try:
+                    _, result, _ = self._prefetch_result_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if isinstance(result, ReceivedBatch):
+                    result.release()
         self._prefetch_enabled = False
 
     # ------------------------------------------------------------------
@@ -380,12 +403,27 @@ class PrefetchDataPackerMixin:
         """
         if not self._prefetch_enabled or self._prefetch_request_queue is None:
             return
+        if self._prefetch_failure is not None:
+            raise ReceiveMemoryError(self._prefetch_failure)
         tasks = self._filter_prefetch_tasks(rollouts)
         if not tasks:
             return
         batch_id = self._prefetch_batch_id
         self._prefetch_batch_id += 1
         self._prefetch_request_queue.put((batch_id, tasks))
+
+    def release_prefetch(self, *, streams=()) -> None:
+        """Release the current cache after ALL final readers (including views).
+
+        Drop consumer-owned aliases before calling. Supply every non-current
+        CUDA stream that read these tensors; release waits for recorded events.
+        Call before collecting the next batch when its admission needs this space.
+        Repeated reads remain valid until this explicit final-use boundary.
+        """
+        cache = self._prefetch_cache
+        if isinstance(cache, ReceivedBatch):
+            cache.release(streams=streams)
+        self._prefetch_cache = {}
 
     def wait_prefetch(self) -> None:
         """Block until the in-flight prefetch completes; populate cache.
@@ -395,11 +433,23 @@ class PrefetchDataPackerMixin:
         """
         if not self._prefetch_enabled or self._prefetch_result_queue is None:
             return
+        if self._prefetch_failure is not None:
+            raise ReceiveMemoryError(self._prefetch_failure)
+        if (
+            isinstance(self._prefetch_cache, ReceivedBatch)
+            and not self._prefetch_cache.released
+        ):
+            raise ReceiveMemoryError(
+                "Call release_prefetch after final use before collecting the next batch"
+            )
         try:
             batch_id, results, fetch_ms = self._prefetch_result_queue.get(
                 timeout=self._prefetch_timeout_s
             )
         except queue.Empty:
+            if getattr(self._transport_strategy, "_receive_budget", None) is not None:
+                self._prefetch_failure = "Bounded NCCL prefetch timed out; shut down the packer before retrying"
+                raise ReceiveMemoryError(self._prefetch_failure) from None
             logger.error(
                 "[PrefetchDataPackerMixin] prefetch timeout after %ss",
                 self._prefetch_timeout_s,
@@ -407,6 +457,9 @@ class PrefetchDataPackerMixin:
             self._prefetch_cache = {}
             return
 
+        if isinstance(results, ReceiveMemoryError):
+            self._prefetch_failure = f"{results}; shut down the packer before retrying"
+            raise ReceiveMemoryError(self._prefetch_failure)
         if isinstance(results, dict) and "_error" in results:
             logger.warning(
                 "[PrefetchDataPackerMixin] batch %d prefetch error: %s",
@@ -500,12 +553,26 @@ class PrefetchDataPackerMixin:
                         batch_id,
                         err,
                     )
-                    results = {"_error": err}
+                    results = (
+                        ReceiveMemoryError(err)
+                        if isinstance(e, ReceiveMemoryError)
+                        or getattr(self._transport_strategy, "_receive_budget", None)
+                        is not None
+                        else {"_error": err}
+                    )
                 fetch_end = get_trace_time()
 
-                self._prefetch_result_queue.put(
-                    (batch_id, results, fetch_end - fetch_start)
-                )
+                if self._prefetch_shutdown.is_set() and isinstance(
+                    results, ReceivedBatch
+                ):
+                    results.release()
+                else:
+                    self._prefetch_result_queue.put(
+                        (batch_id, results, fetch_end - fetch_start)
+                    )
+                # The queue/cache now owns this result. Keeping the worker local
+                # would retain the previous decoded batch throughout the next fetch.
+                del results
         except Exception as e:  # pragma: no cover - worker-thread crash
             logger.error("[PrefetchDataPackerMixin] worker loop error: %s", e)
         finally:
