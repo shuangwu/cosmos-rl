@@ -22,6 +22,10 @@ See [trainer_batching.md](trainer_batching.md) for the opt-in objective windows,
 episode identity contract, count agreement and prefetch integration. This path
 supports uneven/empty local batches without duplicate samples. It is layered on
 the expanded batching contract and inherits its pure-DP topology restrictions.
+Counts, schedules and skip decisions include every policy replica participating
+in the supplied gradient communicator, not just the local DP group. The default
+loss multiplier compensates both averaging stages. This does not depend on the
+payload transfer backend and does not support changing the sealed gradient cohort.
 
 ## OpenVLA and PI05 GRPO
 
@@ -66,6 +70,12 @@ even when an all-empty update skips optimization.
 an independent single-process reference, including momentum, weight decay,
 scheduler state, repeated mu iterations, uneven episodes, empty ranks, all-empty
 windows, filtering, fixed/dynamic schedules and prefetch on/off.
+`tests/test_objective_cohort.py` uses four real Gloo processes arranged as two DP
+ranks in each of two policy replicas. It compares the combined gradient and
+optimizer state with a global reference, including an entirely empty replica,
+recoverable preparation failures, successive updates, and configuration/step
+disagreements before forward/backward. Its adapter exercises the gradient
+communicator's reductions; it does not validate native NCCL recovery.
 `tests/test_vla_objective_weighting.py` executes the actual OpenVLA/PI05 loops with
 CPU model and clock substitutes to check both objectives at several chunk sizes
 and all-empty updates. Compatibility tests verify the default legacy formulas,

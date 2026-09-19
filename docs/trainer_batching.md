@@ -139,14 +139,15 @@ consume every window as follows:
 2. Otherwise zero gradients once and execute every slot in `window.slots`,
    including empty local slots with the model's required dummy participation.
 3. Produce one scalar loss per retained sample in preparation order. Backpropagate
-   `window.loss(losses, start=offset, gradient_divisor=dp_size)` for each slice.
+   `window.loss(losses, start=offset)` for each slice.
    Advance `offset` by the local number of samples, not padded dummy rows.
 4. Step optimizer and scheduler once after all slots. Do **not** divide by the
    number of accumulation slots again.
 
-`gradient_divisor` compensates only averaging gradient reductions. Use one for
-sum reductions, the DP world size for DDP averaging, or the product for multiple
-averaging stages. It must match the actual reduction group, never an unrelated
+The default `gradient_divisor` compensates for averaging across the agreed DP
+group and policy-replica gradient cohort. Override it explicitly for sum or mixed
+reductions: use one for all-sum reductions, or the product of only the averaging
+stages' sizes. It must match the actual gradient reductions, never an unrelated
 global world size. This interface rejects the old per-slot `mean_gradient_scale`.
 
 Dynamic mode adds counts to the existing preflight exchange: one integer per
@@ -154,6 +155,18 @@ optimizer window, not per-sample identities or tensors. Fixed schedules retain
 their configured slot count but opting into exact weighting adds this per-update
 count exchange and permits globally empty optimizer windows to skip. Fixed mode
 without objective weighting remains exchange-free after startup.
+
+When gradients also average across policy replicas, pass the existing
+`inter_policy_nccl` gradient communicator to `run_training_step` (the worker
+already does this). A one-time agreement seals the cohort's configuration and
+membership. Each update then agrees schedule width, preparation errors and step
+with a small MAX reduction, followed by a SUM of slot/window counts. A zero-width
+update omits the latter. All replicas therefore use the same slot schedule,
+denominator and empty-window decision; an entirely empty replica participates
+when another has data. There are no per-microbatch count collectives. This is
+independent of the payload transfer backend. Missing configured multi-replica
+communicators and observed membership/communicator changes are rejected; elastic
+cohort changes are not supported by the sealed schedule.
 
 CPU preparation, identity filtering, and normalization semantics are the same
 with synchronous preparation and background payload prefetch. Count agreement,

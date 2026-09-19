@@ -71,13 +71,16 @@ class TrainingObjectiveWindow:
     slots: tuple[int, ...]
     objective: ObjectiveWindow
     global_count: int
+    gradient_divisor: int = 1
 
-    def loss(self, losses, *, start=0, gradient_divisor=1):
+    def loss(self, losses, *, start=0, gradient_divisor=None):
         return self.objective.loss(
             losses,
             start=start,
             global_count=self.global_count,
-            gradient_divisor=gradient_divisor,
+            gradient_divisor=self.gradient_divisor
+            if gradient_divisor is None
+            else gradient_divisor,
         )
 
 
@@ -106,7 +109,7 @@ def _local_objectives(ids, contract):
     )
 
 
-def _objective_windows(batch, plans, contract):
+def _objective_windows(batch, plans, contract, gradient_divisor):
     if contract.objective_weighting is None:
         return ()
     local = _local_objectives(batch.episode_ids, contract)
@@ -128,6 +131,7 @@ def _objective_windows(batch, plans, contract):
                     else 0
                     for plan in plans
                 ),
+                gradient_divisor,
             )
         )
     return tuple(windows)
@@ -175,6 +179,114 @@ def _gather(local):
     return plans
 
 
+def _objective_cohort(trainer, comm):
+    """Seal the existing gradient communicator, never a payload transport.
+
+    One communicator joins corresponding DP ranks in each policy replica. The
+    local preflight is replicated to every DP rank before crossing this cohort.
+    Elastic membership is not supported for a sealed optimizer schedule.
+    """
+    configured = getattr(
+        getattr(getattr(trainer.config, "policy", None), "parallelism", None),
+        "n_init_replicas",
+        1,
+    )
+    if comm is None:
+        sealed = getattr(trainer, "_sealed_objective_cohort", None)
+        if sealed is not None and sealed[0] is not None:
+            raise ValueError(
+                "Objective gradient communicator disappeared after agreement"
+            )
+        if configured > 1 and trainer.batching_contract.objective_weighting is not None:
+            raise ValueError("Multi-replica objectives require inter_policy_nccl")
+        trainer._sealed_objective_cohort = (None, (), 1)
+        return 1
+    comm.wait_comm_ready()
+    replicas = comm.world_size()
+    if type(replicas) is not int or replicas < 1:
+        raise ValueError("Invalid objective gradient cohort size")
+    membership = tuple(sorted(comm.replica_name_to_rank.items()))
+    identity = (comm, membership, replicas)
+    sealed = getattr(trainer, "_sealed_objective_cohort", None)
+    if sealed is not None:
+        if sealed != identity:
+            raise ValueError("Objective gradient cohort changed after agreement")
+        return replicas
+    if replicas > 1:
+        policy = trainer.config.train.train_policy
+        contract = trainer.batching_contract
+        signature = [
+            policy.mini_batch,
+            policy.mu_iterations,
+            trainer._sealed_batching_dp_size,
+            contract.fixed_minibatches or 0,
+            contract.accumulation_steps,
+            {"sample": 1, "episode": 2}[contract.objective_weighting],
+            int(contract.partial_tail == "include"),
+        ]
+        # MAX of both signs compares minima and maxima in one collective.
+        expected = signature + [-value for value in signature]
+        agreement = torch.tensor(expected, dtype=torch.int64, device=trainer.device)
+        comm.allreduce(agreement, agreement, op=dist.ReduceOp.MAX)
+        if agreement.tolist() != expected:
+            raise ValueError(
+                "Policy replicas disagree on objective schedule configuration"
+            )
+    trainer._sealed_objective_cohort = identity
+    return replicas
+
+
+def _cohort_objective_plans(trainer, plans, comm, current_step):
+    """Agree widths/errors, then sum counts across the gradient cohort.
+
+    Only small integer metadata crosses replicas, on the training thread. No
+    losses, identities, payloads, or model state are exchanged here.
+    """
+    contract = trainer.batching_contract
+    errors = [plan["error"] for plan in plans if plan["error"]]
+    width = contract.fixed_minibatches or max(len(plan["sizes"]) for plan in plans)
+    if type(current_step) is not int or current_step < 0:
+        errors.append("current_step must be a nonnegative integer")
+        current_step = 0
+    header = torch.tensor(
+        [width, bool(errors), current_step, -current_step],
+        dtype=torch.int64,
+        device=trainer.device,
+    )
+    comm.allreduce(header, header, op=dist.ReduceOp.MAX)
+    width, failed, high_step, negative_low_step = header.tolist()
+    if failed:
+        raise ValueError(
+            f"Expanded objective preflight failed in the gradient cohort; local errors: {errors}"
+        )
+    if high_step != -negative_low_step:
+        raise ValueError("Policy replicas disagree on objective training step")
+    n_windows = (width + contract.accumulation_steps - 1) // contract.accumulation_steps
+    values = [
+        sum(plan["sizes"][i] if i < len(plan["sizes"]) else 0 for plan in plans)
+        for i in range(width)
+    ]
+    values += [
+        sum(
+            plan["objective_counts"][i] if i < len(plan["objective_counts"]) else 0
+            for plan in plans
+        )
+        for i in range(n_windows)
+    ]
+    if values:
+        totals = torch.tensor(values, dtype=torch.int64, device=trainer.device)
+        comm.allreduce(totals, totals, op=dist.ReduceOp.SUM)
+        values = totals.tolist()
+    return [
+        {
+            "sizes": tuple(values[:width]),
+            "objective_counts": tuple(values[width:]),
+            "mu": plans[0]["mu"],
+            "error": None,
+        }
+    ]
+
+
 def agree_batching_schedule(trainer):
     """Seal replica-local configuration once, before any expanded preparation.
 
@@ -197,6 +309,7 @@ def agree_batching_schedule(trainer):
     if any(type(value) is not int or value < 1 for value in signature[1:]):
         raise ValueError("mini_batch and mu_iterations must be positive integers")
     trainer._sealed_batching_schedule = (signature, group)
+    trainer._sealed_batching_dp_size = len(signatures)
 
 
 def _require_cpu(value):
@@ -341,6 +454,12 @@ def run_training_step(trainer, *, before_step=None, **kwargs):
     agree_batching_schedule(trainer)
 
     policy = trainer.config.train.train_policy
+    comm = kwargs.get("inter_policy_nccl")
+    replicas = (
+        _objective_cohort(trainer, comm)
+        if contract.objective_weighting is not None
+        else 1
+    )
     mu = getattr(policy, "mu_iterations", None)
     dropped = 0
     recovery = None
@@ -379,6 +498,14 @@ def run_training_step(trainer, *, before_step=None, **kwargs):
         )
         return _consume(trainer, batch, before_step, dropped, recovery, kwargs)
     plans = _gather(local)
+    gradient_divisor = len(plans) * replicas
+    if contract.objective_weighting is not None and replicas > 1:
+        plans = _cohort_objective_plans(
+            trainer, plans, comm, kwargs.get("current_step", 0)
+        )
+        # The HA communicator can rebuild while metadata is in flight. Never
+        # train with counts accepted for a different observed participant set.
+        _objective_cohort(trainer, comm)
     errors = [(rank, plan["error"]) for rank, plan in enumerate(plans) if plan["error"]]
     if errors:
         raise ValueError(f"Expanded training preflight failed on ranks: {errors}")
@@ -409,7 +536,7 @@ def run_training_step(trainer, *, before_step=None, **kwargs):
         batch.global_sample_counts,
         batch.mu_iterations,
         batch.episode_ids if contract.objective_weighting is not None else None,
-        _objective_windows(batch, plans, contract),
+        _objective_windows(batch, plans, contract, gradient_divisor),
     )
     return _consume(trainer, batch, before_step, dropped, recovery, kwargs)
 
