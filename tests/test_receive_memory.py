@@ -8,6 +8,7 @@ import queue
 import threading
 import time
 import weakref
+from collections import deque
 from unittest import mock
 
 import numpy as np
@@ -149,8 +150,6 @@ def make_receiver(monkeypatch, limit=1000):
     seen = []
 
     def rendezvous(ref, pynccl):
-        # The previous receive allocation must be gone before the next begins.
-        assert all(r() is None for r in raw_refs)
         schema = ref["schema"]
         _, size = schema_layout(schema)
         raw = nccl._alloc_recv_buffer(schema, "cpu")
@@ -193,7 +192,7 @@ def refs_for(sizes):
 
 
 def test_incremental_receive_alignment_equivalence_and_budget(monkeypatch):
-    receiver, raw_refs, seen = make_receiver(monkeypatch, limit=150)
+    receiver, raw_refs, seen = make_receiver(monkeypatch, limit=90)
     refs = refs_for([3, 5, 9])
     batch, nbytes, _ = receiver._fetch_all(refs)
     assert isinstance(batch, ReceivedBatch)
@@ -267,6 +266,7 @@ def test_prefetch_error_propagation_and_unreleased_cache_guard():
     packer = PrefetchDataPackerMixin()
     packer._prefetch_enabled = True
     packer._prefetch_result_queue = queue.Queue()
+    packer._prefetch_outstanding = deque([0])
     packer._prefetch_cache = {}
     packer._prefetch_result_queue.put((0, ReceiveMemoryError("oversized"), 0))
     with pytest.raises(ReceiveMemoryError, match="oversized"):
@@ -300,9 +300,11 @@ def test_worker_drops_previous_result_reference():
     packer._setup_prefetch()
     try:
         packer._prefetch_request_queue.put((0, []))
+        packer._prefetch_outstanding.append(0)
         packer.wait_prefetch()
         packer.release_prefetch()
         packer._prefetch_request_queue.put((1, []))
+        packer._prefetch_outstanding.append(1)
         assert entered_second.wait(1)
         gc.collect()
         assert refs[0]() is None
@@ -315,10 +317,7 @@ def test_worker_drops_previous_result_reference():
 def test_repeated_batches_have_bounded_peaks_without_leaks(monkeypatch, batch_size):
     sizes = [3 + i % 5 for i in range(batch_size)]
     decoded = sum(n + 8 for n in sizes)
-    required = max(
-        sum(n + 8 for n in sizes[: i + 1]) + HEADER_NBYTES + n + 8
-        for i, n in enumerate(sizes)
-    )
+    required = decoded + HEADER_NBYTES + max(sizes) + 8
     receiver, raw_refs, _ = make_receiver(monkeypatch, limit=required)
     for _ in range(5):
         batch, _, _ = receiver._fetch_all(refs_for(sizes))
@@ -327,7 +326,8 @@ def test_repeated_batches_have_bounded_peaks_without_leaks(monkeypatch, batch_si
         assert receiver._receive_budget.used == 0
     assert all(ref() is None for ref in raw_refs)
     stats = receiver.receive_memory_stats()
-    assert stats["peak_tensor_bytes"] == required
+    assert stats["peak_tensor_bytes"] <= required
+    assert stats["peak_reserved_bytes"] == required
     assert stats["peak_reserved_bytes"] == required
 
 
@@ -414,17 +414,82 @@ def test_cuda_views_and_multiple_reader_streams():
 
 def test_bounded_timeout_cannot_consume_late_result_as_next_batch():
     packer = PrefetchDataPackerMixin()
-    packer._prefetch_enabled = True
-    packer._prefetch_timeout_s = 0.001
-    packer._prefetch_result_queue = queue.Queue()
-    packer._prefetch_cache = {}
-    packer._transport_strategy = mock.Mock(_receive_budget=ReceiveBudget(10, 1))
-    with pytest.raises(ReceiveMemoryError, match="timed out"):
-        packer.wait_prefetch()
-    packer._prefetch_result_queue.put((0, {"late": True}, 0))
-    with pytest.raises(ReceiveMemoryError, match="shut down"):
-        packer.wait_prefetch()
-    assert packer._prefetch_result_queue.qsize() == 1
+    packer._setup_prefetch(prefetch_timeout=0.01)
+    try:
+        # No work is queued: simulate an outstanding receive that never returns.
+        batch_id = packer._arm_prefetch_deadline()
+        packer._prefetch_outstanding.append(batch_id)
+        assert packer._prefetch_shutdown.wait(2)
+        with pytest.raises(TimeoutError, match="exceeded"):
+            packer.wait_prefetch()
+        packer._prefetch_result_queue.put((batch_id, {"late": True}, 0))
+        with pytest.raises(TimeoutError, match="exceeded"):
+            packer.wait_prefetch()
+        assert packer._prefetch_cache == {}
+    finally:
+        packer.shutdown_prefetch()
+
+
+@pytest.mark.parametrize("limit,expected", [(90, [1, 1, 1]), (150, [2, 1]), (200, [3])])
+def test_receive_window_scales_with_available_budget(monkeypatch, limit, expected):
+    receiver, raw_refs, _ = make_receiver(monkeypatch, limit)
+    widths = []
+    original = receiver._fetch_unbounded
+
+    def fetch(refs):
+        assert all(ref() is None for ref in raw_refs)
+        widths.append(len(refs))
+        return original(refs)
+
+    monkeypatch.setattr(receiver, "_fetch_unbounded", fetch)
+    batch, _, _ = receiver._fetch_all(refs_for([3, 5, 9]))
+    assert widths == expected
+    assert receiver._receive_budget.peak <= limit
+    assert receiver._receive_budget.peak_live <= receiver._receive_budget.peak
+    batch.release()
+    assert receiver._receive_budget.used == 0
+
+
+@pytest.mark.parametrize("error", [False, True])
+@pytest.mark.parametrize("consume", [False, True])
+def test_prepared_lease_survives_until_consumer_release_or_shutdown(error, consume):
+    budget = ReceiveBudget(64, 1)
+
+    class Packer(PrefetchDataPackerMixin):
+        def _filter_prefetch_tasks(self, rollouts):
+            return [(0, "ref")]
+
+        def _fetch_batch(self, tasks):
+            budget.reserve(64)
+            budget.attribute(decoded=64)
+            return ReceivedBatch({"ref": {"x": torch.ones(16)}}, budget, 64)
+
+    packer = Packer()
+    packer._setup_prefetch()
+
+    def prepare():
+        if error:
+            raise ValueError("bad preparation")
+        return packer._preparation_local.cache["ref"]["x"][:2]
+
+    try:
+        future = packer.start_prepared_prefetch([], prepare)
+        if error:
+            with pytest.raises(ValueError, match="bad preparation"):
+                future.result(timeout=2)
+        else:
+            future.result(timeout=2)
+        assert budget.used == 64
+        if consume:
+            packer.release_prepared_prefetch(future)
+            assert budget.used == 64
+            assert isinstance(packer._prefetch_cache, ReceivedBatch)
+            del future  # Drop prepared aliases before final-reader release.
+            packer.release_prefetch()
+            assert budget.used == 0
+    finally:
+        packer.shutdown_prefetch()
+    assert budget.used == 0
 
 
 def test_lease_keeps_storage_alive_when_consumer_mutates_dictionary():

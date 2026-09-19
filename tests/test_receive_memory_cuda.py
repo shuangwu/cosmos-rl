@@ -338,3 +338,36 @@ def test_dictionary_mutation_cannot_drop_storage_before_final_cuda_reader(endpoi
     assert all(torch.isfinite(value).item() for value in values)
     assert torch.cuda.memory_allocated(1) < allocated
     assert env.strategy.receive_memory_stats()["reserved_bytes"] == 0
+
+
+def test_concurrent_window_and_prepared_cpu_lease(endpoint, monkeypatch):
+    env = endpoint(64 * MAX_BYTES + 256)
+    widths = []
+    original = env.strategy._fetch_unbounded
+
+    def receive(refs):
+        widths.append(len(refs))
+        return original(refs)
+
+    monkeypatch.setattr(env.strategy, "_fetch_unbounded", receive)
+    refs = env.batch(count=6)
+
+    def prepare():
+        return [
+            {key: tensor.cpu() for key, tensor in payload.items()}
+            for payload in env.packer._preparation_local.cache.values()
+        ]
+
+    future = env.packer.start_prepared_prefetch(refs, prepare)
+    prepared = future.result(timeout=30)
+    assert widths == [6]
+    assert len(prepared) == 6
+    assert all(t.device.type == "cpu" for p in prepared for t in p.values())
+    stats = env.strategy.receive_memory_stats()
+    assert 0 < stats["reserved_bytes"] <= stats["budget_bytes"]
+    assert stats["peak_tensor_bytes"] <= stats["peak_reserved_bytes"]
+    env.packer.release_prepared_prefetch(future)
+    assert env.strategy.receive_memory_stats()["reserved_bytes"] > 0
+    del future, prepared
+    env.packer.release_prefetch()
+    assert env.strategy.receive_memory_stats()["reserved_bytes"] == 0

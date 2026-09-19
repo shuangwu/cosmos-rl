@@ -21,7 +21,7 @@ order, let D be its decoded storage bytes and R its wire bytes (including the
 32-byte device header). Before contacting any sender, reserve:
 
 ```
-max(prefix decoded bytes including this payload + R)
+sum(D) + max(R)
 ```
 
 Reservations for other batches, including unreleased consumer leases, also
@@ -32,19 +32,23 @@ A batch that cannot fit fails immediately with the required bytes and suggested
 remedies. Waiting for an older consumer has a bounded, actionable timeout;
 shutdown wakes admission waiters immediately.
 
-Within an admitted batch, each payload is received, verified, and decoded before
-receiving the next. The existing alignment clones remain. Receive completion
-and decode completion are observed before advancing; all raw-buffer aliases in
-the existing receive helper disappear when its per-payload call returns.
+After admission, grow the wire workspace using currently available capacity,
+up to `sum(R)`, without waiting while holding a reservation. Receive as many
+consecutive payloads concurrently as fit that workspace. Each sender rendezvous
+is immediately followed by its matching receive enqueue; independent NCCL
+communicators are not grouped. Receive and decode completion are observed before
+advancing to the next window. The existing alignment clones remain; raw-buffer
+aliases disappear when the window's receive helper returns.
 Reservations shrink to actual unique decoded storage at handoff. Truncated views
 are charged for their **full backing storage**, and aliases of the same storage
 are counted once. Peak reservations are conservative admission figures, distinct
 from peak charged tensor bytes.
 
 Compute on the prior batch and reception of the next still overlap when both
-fit. This first implementation serializes payloads within the receiving batch,
-even with extra headroom. It deliberately trades that receive concurrency for
-predictable workspace. Measure throughput before selecting a production budget.
+fit. A minimal budget yields single-payload windows; additional available bytes
+allow concurrent receives. Workspace stays reserved until batch handoff. This
+avoids an admission cycle but can temporarily reduce capacity available to other
+requests. Measure throughput before selecting a production budget.
 
 The cap excludes model/optimizer tensors, autograd state, consumer-created
 copies/minibatch caches, CPU control-plane/header copies, NCCL internal memory,
@@ -78,6 +82,23 @@ be used or retained after release**. An external alias retained after release
 violates the budget contract. Calls to release/collect must be serialized on the
 consumer thread.
 
+### Prepared batches (#753)
+
+This PR depends on #753 and its #747 watchdog dependency. Prepared prefetch
+retains the received lease independently of its thread-local cache. Consuming
+the preparation future transfers that lease to the ordinary consumer cache;
+it does not return capacity. After final training readers and after dropping
+prepared aliases, call the same `release_prefetch(streams=...)` API. This also
+applies when preparation raises: discard the failed prepared state and release
+the handed-off lease, or shut down the packer before consumption.
+
+Unconsumed prepared leases are released by shutdown after the worker exits;
+already-consumed leases remain the consumer's responsibility. Do not retain
+prepared futures/results across shutdown. CPU preparation completing is not
+proof that all payload aliases have finished. No automatic early release is
+inferred for independent CPU copies. Memory created by preparation remains
+outside the transport budget.
+
 The next prefetch may be started before release to overlap communication and
 compute. Release the old batch before `wait_prefetch`/`collect_prefetch` for the
 next one; attempting to replace an unreleased cache raises an actionable error.
@@ -88,9 +109,10 @@ handoff. Shutdown closes admission and uses the existing communicator abort/join
 lifecycle. It releases unconsumed queued batches after the worker stops. It does
 **not** infer final use of a batch already handed to a consumer: the consumer
 must still release that batch. Memory/prefetch errors are fatal to the attempted
-collection and never silently turn into empty episodes. After a prefetch timeout,
-shut down the packer before retrying to avoid consuming a late result as a new
-batch. Existing per-transfer recovery/fallback behavior remains in the receive
+collection and never silently turn into empty episodes. The shared independent
+watchdog covers admission, receive and preparation even without consumption;
+strategy-backed expiry exits without native cleanup. Do not retry a timed-out
+packer. Existing per-transfer recovery/fallback behavior remains in the receive
 helper. Failure to prove CUDA completion closes admission and retains the
 reservation; restart that receiver rather than reusing its capacity.
 
@@ -163,10 +185,10 @@ PR. For such an evaluation, record separately for **every trainer**:
 Include all final NDAS readers in the release contract. Compare sustained receive
 peaks and throughput with the motivating workload, without per-wave cache flushes.
 Keep source/image hashes, job configuration, and per-trainer logs with results.
-## Recorded validation results
+## Previous serial-window validation (not evidence for the concurrent revision)
 
-Final-source H100 job **2256429** completed successfully (exit 0) on two H100
-80GB GPUs. All **41 contract/acceptance/round-trip tests passed with zero skips**,
+The previous serial implementation completed successfully on two H100 80GB GPUs.
+All **41 contract/acceptance/round-trip tests passed with zero skips**,
 including standalone data/loss/gradient equivalence, real prefetch overlap,
 backpressure, admission cancellation, injected decode-error cleanup, and dictionary
 mutation while a CUDA reader remained pending. The lease now holds unique backing

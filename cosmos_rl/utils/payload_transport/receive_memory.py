@@ -63,6 +63,16 @@ class ReceiveBudget:
             self.used -= size
             self.condition.notify_all()
 
+    def reserve_available(self, size):
+        """Grow an admitted workspace without waiting while holding capacity."""
+        with self.condition:
+            if self.closed:
+                raise ReceiveMemoryError("NCCL receive admission cancelled by shutdown")
+            granted = min(size, self.limit - self.used)
+            self.used += granted
+            self.peak = max(self.peak, self.used)
+            return granted
+
     def attribute(self, *, raw=0, decoded=0):
         with self.condition:
             self.raw += raw

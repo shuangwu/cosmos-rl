@@ -393,13 +393,14 @@ class NCCLTransportStrategy(PayloadTransportStrategy):
 
     def _fetch_bounded(self, refs):
         budget = self._receive_budget
-        decoded_prefix = 0
-        required = 0
+        decoded_size = 0
+        wire_sizes = []
         for _, ref in refs:
             _, raw_size = schema_layout(ref["schema"])
-            decoded_size = sum(spec.nbytes for spec in ref["schema"])
-            decoded_prefix += decoded_size
-            required = max(required, decoded_prefix + HEADER_NBYTES + raw_size)
+            decoded_size += sum(spec.nbytes for spec in ref["schema"])
+            wire_sizes.append(HEADER_NBYTES + raw_size)
+        workspace = max(wire_sizes)
+        required = decoded_size + workspace
         budget.reserve(required)
         results = {}
         part = {}
@@ -415,12 +416,26 @@ class NCCLTransportStrategy(PayloadTransportStrategy):
 
         self._decode_account = account_decode
         try:
-            for idx, ref in refs:
+            # Reserve all decoded storage plus at least one receive up front.
+            # Additional workspace uses currently free bytes, never a blocking
+            # reservation that could deadlock behind our own admitted batch.
+            extra = budget.reserve_available(sum(wire_sizes) - workspace)
+            workspace += extra
+            required += extra
+            cursor = 0
+            while cursor < len(refs):
                 if budget.closed:
                     raise ReceiveMemoryError("NCCL receive cancelled by shutdown")
-                # Each call fully completes its recv and drops every raw alias
-                # before the next payload is admitted. Keep the alignment clones.
-                part, nbytes, _ = self._fetch_unbounded([(idx, ref)])
+                end, wire_bytes = cursor, 0
+                while end < len(refs) and wire_bytes + wire_sizes[end] <= workspace:
+                    wire_bytes += wire_sizes[end]
+                    end += 1
+                # The existing helper posts each matching receive immediately
+                # after rendezvous, then observes completion for the window.
+                # Never group independent communicators with ncclGroupStart.
+                window = refs[cursor:end]
+                ref = window[0][1]
+                part, nbytes, _ = self._fetch_unbounded(window)
                 if torch.cuda.is_available():
                     torch.cuda.current_stream(self._device).synchronize()
                 results.update(part)
@@ -430,6 +445,7 @@ class NCCLTransportStrategy(PayloadTransportStrategy):
                 attributed = current
                 total_bytes += nbytes
                 budget.attribute(raw=-budget.raw)
+                cursor = end
             actual = storage_bytes(results.values())
             if actual > required:
                 raise ReceiveMemoryError("Decoded storage exceeded schema reservation")
