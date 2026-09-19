@@ -11,6 +11,7 @@ import torch
 import numpy as np
 import torch.distributed as dist
 from cosmos_rl.utils.logging import logger
+from cosmos_rl.policy.trainer.objectives import ObjectiveWindow
 
 
 @dataclass(frozen=True)
@@ -24,10 +25,16 @@ class ExpandedSampleBatching:
 
     partial_tail: Literal["include", "reject"] = "reject"
     fixed_minibatches: int | None = None
+    objective_weighting: Literal["sample", "episode"] | None = None
+    accumulation_steps: int = 1
 
     def __post_init__(self):
         if self.partial_tail not in ("include", "reject"):
             raise ValueError("Unsupported partial-tail policy")
+        if self.objective_weighting not in (None, "sample", "episode"):
+            raise ValueError("Unsupported objective weighting")
+        if type(self.accumulation_steps) is not int or self.accumulation_steps < 1:
+            raise ValueError("accumulation_steps must be a positive integer")
         if self.fixed_minibatches is not None and (
             type(self.fixed_minibatches) is not int or self.fixed_minibatches < 1
         ):
@@ -45,12 +52,85 @@ class ExpandedTrainingBatch:
     minibatches: tuple[Sequence, ...]
     global_sample_counts: tuple[int, ...] | None = ()
     mu_iterations: int = 1
+    episode_ids: tuple[Sequence, ...] | None = None
+    objective_windows: tuple = ()
 
     def mean_gradient_scale(self, index, world_size):
         """Scale a local SUM loss when the trainer averages gradients across ranks."""
+        if self.objective_windows:
+            raise ValueError("Use objective_windows for accumulation-aware weighting")
         if self.global_sample_counts is None:
             raise ValueError("Fixed schedules require trainer-owned sample weighting")
         return world_size / self.global_sample_counts[index]
+
+
+@dataclass(frozen=True)
+class TrainingObjectiveWindow:
+    """One optimizer update; all slots accumulate before stepping."""
+
+    slots: tuple[int, ...]
+    objective: ObjectiveWindow
+    global_count: int
+
+    def loss(self, losses, *, start=0, gradient_divisor=1):
+        return self.objective.loss(
+            losses,
+            start=start,
+            global_count=self.global_count,
+            gradient_divisor=gradient_divisor,
+        )
+
+
+def _local_objectives(ids, contract):
+    if contract.objective_weighting is None:
+        return ()
+    if contract.objective_weighting == "episode":
+        owners = {}
+        for slot, identities in enumerate(ids):
+            window = slot // contract.accumulation_steps
+            for identity in identities:
+                if owners.setdefault(identity, window) != window:
+                    raise ValueError(
+                        "An episode must fit within one optimizer accumulation window"
+                    )
+    return tuple(
+        ObjectiveWindow.prepare(
+            [
+                identity
+                for slot in ids[start : start + contract.accumulation_steps]
+                for identity in slot
+            ],
+            contract.objective_weighting,
+        )
+        for start in range(0, len(ids), contract.accumulation_steps)
+    )
+
+
+def _objective_windows(batch, plans, contract):
+    if contract.objective_weighting is None:
+        return ()
+    local = _local_objectives(batch.episode_ids, contract)
+    windows = []
+    for start in range(0, len(batch.minibatches), contract.accumulation_steps):
+        slots = tuple(
+            range(
+                start, min(start + contract.accumulation_steps, len(batch.minibatches))
+            )
+        )
+        window = start // contract.accumulation_steps
+        windows.append(
+            TrainingObjectiveWindow(
+                slots,
+                local[window],
+                sum(
+                    plan["objective_counts"][window]
+                    if window < len(plan["objective_counts"])
+                    else 0
+                    for plan in plans
+                ),
+            )
+        )
+    return tuple(windows)
 
 
 class RecoverablePreparationError(Exception):
@@ -144,15 +224,47 @@ def _prepare_local_batch(trainer, rollouts, *, background=False):
         )
     _describe(batch, policy.mini_batch)
     cleaned = []
+    cleaned_ids = []
     dropped = 0
-    for samples in batch.minibatches:
+    if batch.episode_ids is not None and (
+        len(batch.episode_ids) != len(batch.minibatches)
+        or any(
+            len(ids) != len(samples)
+            for ids, samples in zip(batch.episode_ids, batch.minibatches)
+        )
+    ):
+        raise ValueError("episode_ids must identify every prepared sample")
+    if (
+        contract.objective_weighting == "episode"
+        and batch.episode_ids is None
+        and any(batch.minibatches)
+    ):
+        raise ValueError("Episode weighting requires prepared episode_ids")
+    for index, samples in enumerate(batch.minibatches):
         if background:
             _require_cpu(samples)
-        valid = tuple(sample for sample in samples if _finite(sample))
+        ids = (
+            batch.episode_ids[index]
+            if batch.episode_ids is not None
+            else tuple(range(len(samples)))
+        )
+        retained = tuple(
+            (sample, identity)
+            for sample, identity in zip(samples, ids)
+            if _finite(sample)
+        )
+        valid = tuple(sample for sample, _ in retained)
         if contract.partial_tail == "reject" and len(valid) < policy.mini_batch:
             valid = ()
+            retained = ()
+        # IDs are rank-local and CPU metadata, never payload tensors.
+        if contract.objective_weighting == "episode" and any(
+            type(identity) not in (int, str) for _, identity in retained
+        ):
+            raise ValueError("Episode IDs must be integer or string metadata")
         dropped += len(samples) - len(valid)
         cleaned.append(valid)
+        cleaned_ids.append(tuple(identity for _, identity in retained))
     if (
         contract.fixed_minibatches is not None
         and len(cleaned) > contract.fixed_minibatches
@@ -160,7 +272,11 @@ def _prepare_local_batch(trainer, rollouts, *, background=False):
         raise ValueError(
             "Prepared batch exceeds sealed fixed_minibatches; trainer must bound preparation"
         )
-    return ExpandedTrainingBatch(tuple(cleaned)), dropped, recovery
+    return (
+        ExpandedTrainingBatch(tuple(cleaned), episode_ids=tuple(cleaned_ids)),
+        dropped,
+        recovery,
+    )
 
 
 def prefetch_training_batch(trainer, rollouts):
@@ -232,9 +348,20 @@ def run_training_step(trainer, *, before_step=None, **kwargs):
         if type(mu) is not int or mu < 1:
             raise ValueError("mu_iterations must be a positive integer")
         batch, dropped, recovery = _take_local_batch(trainer, kwargs["rollouts"])
-        local = {"sizes": tuple(map(len, batch.minibatches)), "mu": mu, "error": None}
+        local = {
+            "sizes": tuple(map(len, batch.minibatches)),
+            "objective_counts": tuple(
+                objective.count
+                for objective in _local_objectives(batch.episode_ids, contract)
+            ),
+            "mu": mu,
+            "error": None,
+        }
     except Exception as error:
-        if contract.fixed_minibatches is not None:
+        if (
+            contract.fixed_minibatches is not None
+            and contract.objective_weighting is None
+        ):
             # The schedule is already sealed: no extra error agreement here.
             # Unexpected errors use the normal worker/cohort failure path.
             raise
@@ -243,7 +370,7 @@ def run_training_step(trainer, *, before_step=None, **kwargs):
             "mu": mu,
             "error": f"{type(error).__name__}: {error}"[:512],
         }
-    if contract.fixed_minibatches is not None:
+    if contract.fixed_minibatches is not None and contract.objective_weighting is None:
         batch = ExpandedTrainingBatch(
             batch.minibatches
             + ((),) * (contract.fixed_minibatches - len(batch.minibatches)),
@@ -257,24 +384,43 @@ def run_training_step(trainer, *, before_step=None, **kwargs):
         raise ValueError(f"Expanded training preflight failed on ranks: {errors}")
     if len({plan["mu"] for plan in plans}) != 1:
         raise ValueError("Expanded training ranks disagree on configured mu_iterations")
-    width = max(len(plan["sizes"]) for plan in plans)
+    width = contract.fixed_minibatches or max(len(plan["sizes"]) for plan in plans)
     counts = tuple(
         sum(plan["sizes"][i] if i < len(plan["sizes"]) else 0 for plan in plans)
         for i in range(width)
     )
-    active = [i for i, count in enumerate(counts) if count]
+    active = (
+        list(range(width))
+        if contract.fixed_minibatches or contract.objective_weighting is not None
+        else [i for i, count in enumerate(counts) if count]
+    )
     batch = ExpandedTrainingBatch(
         tuple(
             batch.minibatches[i] if i < len(batch.minibatches) else () for i in active
         ),
         tuple(counts[i] for i in active),
         mu,
+        tuple(
+            batch.episode_ids[i] if i < len(batch.episode_ids) else () for i in active
+        ),
+    )
+    batch = ExpandedTrainingBatch(
+        batch.minibatches,
+        batch.global_sample_counts,
+        batch.mu_iterations,
+        batch.episode_ids if contract.objective_weighting is not None else None,
+        _objective_windows(batch, plans, contract),
     )
     return _consume(trainer, batch, before_step, dropped, recovery, kwargs)
 
 
 def _consume(trainer, batch, before_step, dropped, recovery, kwargs):
-    if batch.minibatches and before_step is not None:
+    active = (
+        any(window.global_count for window in batch.objective_windows)
+        if batch.objective_windows
+        else bool(batch.minibatches)
+    )
+    if active and before_step is not None:
         before_step()
     expanded_kwargs = {key: value for key, value in kwargs.items() if key != "rollouts"}
     # Even an all-empty plan reaches the trainer for checkpoint/control work,
@@ -282,7 +428,7 @@ def _consume(trainer, batch, before_step, dropped, recovery, kwargs):
     result = trainer.step_expanded_training(batch, **expanded_kwargs)
     result.update(
         {
-            "batching/skipped_update": int(not batch.minibatches),
+            "batching/skipped_update": int(not active),
             "batching/dropped_samples": dropped,
             "batching/preparation_failed": int(recovery is not None),
         }

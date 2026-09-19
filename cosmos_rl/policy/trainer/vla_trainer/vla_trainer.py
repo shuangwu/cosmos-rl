@@ -22,6 +22,7 @@ from cosmos_rl.dispatcher.data.schema import Rollout
 from cosmos_rl.policy.trainer.base import TrainerRegistry
 from cosmos_rl.utils.distributed import HighAvailabilitylNccl
 from cosmos_rl.utils.logging import logger
+from cosmos_rl.policy.trainer.objectives import masked_sample_means, vla_objective
 
 
 @TrainerRegistry.register(trainer_type="grpo_vla")
@@ -92,7 +93,13 @@ class OpenVLAGRPOTrainer(GRPOTrainer):
             LIBERO_MAX_STEPS_MAP.get(self.config.train.train_policy.dataset.subset, 512)
             // NUM_ACTIONS_CHUNK
         )
-        for policy_input in policy_inputs:
+        objective, global_count, gradient_divisor, max_chunks = vla_objective(
+            self,
+            (self.data_packer.policy_collate_fn(p, max_chunks) for p in policy_inputs),
+            inter_policy_nccl,
+        )
+        sample_offset = 0
+        for policy_input in policy_inputs if global_count else ():
             episode_data = self.data_packer.policy_collate_fn(policy_input, max_chunks)
             task_id = policy_input.task_id
             trial_id = policy_input.trial_id
@@ -100,7 +107,7 @@ class OpenVLAGRPOTrainer(GRPOTrainer):
             # finish_step = policy_input.finish_step
             # complete = policy_input.complete
             advantage = policy_input.advantage
-            episode_valid_responses = episode_data["logprob_masks"].sum()
+            episode_valid_responses = episode_data["logprob_masks"].sum().clamp_min(1)
             num_training_chunks = (
                 max_chunks + TRAINING_CHUNK_SIZE - 1
             ) // TRAINING_CHUNK_SIZE
@@ -138,19 +145,24 @@ class OpenVLAGRPOTrainer(GRPOTrainer):
                     pg_losses2 = -advantage * torch.clamp(
                         ratio, 1.0 - epsilon_low, 1.0 + epsilon_high
                     )
-                    pg_loss = (
-                        torch.max(pg_losses, pg_losses2) * chunk_response_mask
-                    ).sum()
                     pg_clipfrac = (
                         torch.gt(pg_losses2, pg_losses).float() * chunk_response_mask
                     ).sum()
                     ppo_kl = (-negative_approx_kl * chunk_response_mask).sum()
 
-                    policy_loss = pg_loss / episode_valid_responses
                     pg_clipfrac = pg_clipfrac / episode_valid_responses
                     ppo_kl = ppo_kl / episode_valid_responses
 
-                    loss = policy_loss / len(policy_inputs)
+                    sample_losses = masked_sample_means(
+                        torch.max(pg_losses, pg_losses2), chunk_response_mask.bool()
+                    )
+                    loss = objective.loss(
+                        sample_losses,
+                        start=sample_offset,
+                        global_count=global_count,
+                        gradient_divisor=gradient_divisor,
+                    )
+                    sample_offset += sample_losses.numel()
                     loss.backward()
 
                     total_loss += loss.item()
@@ -162,9 +174,10 @@ class OpenVLAGRPOTrainer(GRPOTrainer):
                         f"mask_sum={chunk_valid_responses.item():.0f}"
                         + (" [PADDED]" if chunk_valid_responses == 0 else "")
                     )
-        self.lr_schedulers.step()
+        if global_count:
+            self.lr_schedulers.step()
         current_lr = self.lr_schedulers.get_last_lr()[0]
-        grad_norm = self.all_reduce_states(inter_policy_nccl)
+        grad_norm = self.all_reduce_states(inter_policy_nccl) if global_count else 0.0
 
         end_event.record()
         logger.info(
@@ -180,8 +193,8 @@ class OpenVLAGRPOTrainer(GRPOTrainer):
             )
             report_data["train/learning_rate"] = float(current_lr)
             report_data["train/grad_norm"] = float(grad_norm)
-            report_data["train/loss_avg"] = float(total_loss / len(policy_inputs))
-            report_data["train/loss_max"] = float(max_loss)
+            report_data["train/loss_avg"] = float(total_loss)
+            report_data["train/loss_max"] = float(max_loss) if global_count else 0.0
             report_data["train_step"] = int(current_step)
 
         if is_master_replica and do_save_checkpoint:

@@ -1,0 +1,65 @@
+# Sample- and episode-weighted objectives
+
+An optimizer accumulation window has one denominator. Averaging independently
+normalized microbatch losses is incorrect when their contributing counts differ.
+For scalar sample losses `l`, use either:
+
+- **Sample:** sum of retained sample losses / global retained sample count.
+- **Episode:** sum of each nonempty episode's mean sample loss / global nonempty
+  episode count.
+
+`ObjectiveWindow` prepares CPU weights after filtering and scales loss slices
+against a shared global count. It does not synchronize, change model collective
+participation, clip gradients, or step optimizers. Averaged gradient reductions
+require multiplication by their participant count before backward; sum reductions
+do not. All-empty optimizer windows skip both optimizer and scheduler, including
+momentum and weight-decay updates. A locally empty rank must still participate in
+the model's forward/backward schedule when another rank has data.
+
+## Expanded trainers
+
+See [trainer_batching.md](trainer_batching.md) for the opt-in objective windows,
+episode identity contract, count agreement and prefetch integration. This path
+supports uneven/empty local batches without duplicate samples. It is layered on
+the expanded batching contract and inherits its pure-DP topology restrictions.
+
+## OpenVLA and PI05 GRPO
+
+Set `[vla].objective_weighting` to `"episode"` (default) or `"sample"`.
+A sample is one action chunk's scalar mean over its valid action components.
+Padding contributes neither a sample nor denominator mass. Episode weighting
+then averages these chunk objectives within each nonempty episode.
+
+This corrects PI05's sum of independently normalized microbatch means, whose
+gradient magnitude depended on `training_chunk_size`. Both trainers now use one
+objective window for the whole update. It also removes OpenVLA's division by zero
+for empty episodes and the second division of reported loss by episode count.
+Compared with the old OpenVLA element-weighted episode mean, a partially valid
+final chunk now has the same sample weight as another valid chunk. This is an
+intentional, explicit action-chunk definition, not token weighting.
+
+The fixed-rollout VLA loops have no expanded preflight to reuse. They exchange a
+small count/shape report once per update within the DP mesh, then sum counts over
+the existing inter-replica communicator. This also aligns PI05's padded chunk
+count across DP ranks before FSDP forward/backward. The gradient scaling compensates
+both averaging stages. No count exchange is added per microbatch. Loss reporting
+remains a rank-local scaled contribution, not a newly reduced global metric.
+
+Existing fixed-rollout dispatch must provide matching episode slots within each
+DP replica. A zero-contribution rank uses fully masked episode slots, not missing
+slots; slot disagreement is detected before backward. This is not an automatic
+conversion of VLA to variable-slot expanded scheduling. Counts are obtained in a
+streaming collation pass, then each episode is collated for training; the change
+does not retain every padded episode simultaneously. Checkpoint behavior is kept
+even when an all-empty update skips optimization.
+
+## Validation
+
+`tests/test_objective_weighting.py` compares real two-rank CPU/DDP updates against
+an independent single-process reference, including momentum, weight decay,
+scheduler state, repeated mu iterations, uneven episodes, empty ranks, all-empty
+windows, filtering, fixed/dynamic schedules and prefetch on/off.
+`tests/test_vla_objective_weighting.py` executes the actual OpenVLA/PI05 loops with
+CPU model and clock substitutes to check both objectives at several chunk sizes
+and all-empty updates. These are numerical regressions, not full simulator/GPU
+lifecycle validation.

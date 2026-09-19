@@ -1699,6 +1699,10 @@ class LoggingConfig(BaseModel):
 
 
 class VLAConfig(BaseModel):
+    objective_weighting: Literal["sample", "episode"] = Field(
+        default="episode",
+        description="GRPO objective: equal valid action-chunk samples or equal nonempty episodes per optimizer update.",
+    )
     vla_type: str = Field(
         default="openvla-oft",
         description="VLA type: openvla-oft, openvla, or cosmos-policy",
