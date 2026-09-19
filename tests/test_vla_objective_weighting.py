@@ -59,12 +59,20 @@ class Packer:
 
 
 @pytest.mark.parametrize("cls", [PI05GRPOTrainer, OpenVLAGRPOTrainer])
-@pytest.mark.parametrize("weighting,expected", [("sample", 0.3), ("episode", 0.4)])
+@pytest.mark.parametrize(
+    "weighting,expected", [("sample", 0.3), ("episode", 0.4), (None, 0.4)]
+)
 @pytest.mark.parametrize("chunk_size", [1, 2, 3])
 @pytest.mark.parametrize("empty", [False, True])
 def test_production_objective_is_chunk_invariant(
-    monkeypatch, cls, weighting, expected, chunk_size, empty
+    monkeypatch, cls, weighting, expected, chunk_size, empty, partial=False
 ):
+    if weighting is None and empty:
+        pytest.skip(
+            "Legacy empty-episode behavior is not changed by this opt-in feature"
+        )
+    if weighting is None and cls is PI05GRPOTrainer:
+        expected = {1: 0.6, 2: 0.525, 3: 0.4}[chunk_size]
     monkeypatch.setattr(
         torch.cuda,
         "Event",
@@ -85,6 +93,21 @@ def test_production_objective_is_chunk_invariant(
     trainer.device = torch.device("cpu")
     trainer.model = Model()
     trainer.data_packer = Packer()
+    if partial:
+        original = trainer.data_packer.policy_collate_fn
+
+        def partially_valid(policy_input, max_chunks):
+            data = original(policy_input, max_chunks)
+            for key in ("input_ids", "logprob_masks", "old_log_probs"):
+                data[key] = data[key].repeat(1, 2)
+            if len(policy_input.values) == 3:
+                data["logprob_masks"][2, 1] = False
+            return data
+
+        trainer.data_packer.policy_collate_fn = partially_valid
+    trainer.data_packer.policy_collate_fn = Mock(
+        wraps=trainer.data_packer.policy_collate_fn
+    )
     trainer.parallel_dims = SimpleNamespace(dp_enabled=False)
     trainer.global_rank = 0
     trainer.config = SimpleNamespace(
@@ -113,9 +136,9 @@ def test_production_objective_is_chunk_invariant(
 
     trainer.all_reduce_states = Mock(side_effect=step)
     comm = SimpleNamespace(
-        wait_comm_ready=lambda: None,
+        wait_comm_ready=Mock(),
         world_size=lambda: 1,
-        allreduce=lambda *args, **kwargs: None,
+        allreduce=Mock(),
     )
     episodes = [
         SimpleNamespace(
@@ -133,3 +156,36 @@ def test_production_objective_is_chunk_invariant(
     assert trainer.model.weight.item() == pytest.approx(0.0 if empty else expected)
     assert trainer.all_reduce_states.call_count == (0 if empty else 1)
     assert trainer.lr_schedulers.last_epoch == (0 if empty else 1)
+    if weighting is None:
+        # Default execution must not pay for the opt-in count/collation pass.
+        assert trainer.data_packer.policy_collate_fn.call_count == len(episodes)
+        comm.wait_comm_ready.assert_not_called()
+        comm.allreduce.assert_not_called()
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 3])
+@pytest.mark.parametrize(
+    "weighting,expected", [(None, 0.39), ("episode", 0.4), ("sample", 0.3)]
+)
+def test_partial_final_chunk_keeps_legacy_default(
+    monkeypatch, chunk_size, weighting, expected
+):
+    # First episode: component mean (1+1+2+2+3)/5 = 1.8, not chunk mean 2.
+    # Second episode: mean 6. Legacy gradient = (1.8+6)/2 = 3.9.
+    test_production_objective_is_chunk_invariant(
+        monkeypatch,
+        OpenVLAGRPOTrainer,
+        weighting,
+        expected,
+        chunk_size,
+        False,
+        partial=True,
+    )
+
+
+def test_new_objective_requires_explicit_configuration():
+    from cosmos_rl.policy.config import VLAConfig
+
+    assert VLAConfig().objective_weighting is None
+    assert VLAConfig(objective_weighting="sample").objective_weighting == "sample"
+    assert VLAConfig(objective_weighting="episode").objective_weighting == "episode"

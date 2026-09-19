@@ -25,20 +25,27 @@ the expanded batching contract and inherits its pure-DP topology restrictions.
 
 ## OpenVLA and PI05 GRPO
 
-Set `[vla].objective_weighting` to `"episode"` (default) or `"sample"`.
+Leave `[vla].objective_weighting` unset to preserve the trainer's existing
+normalization. OpenVLA retains its within-episode valid-component mean, including
+the existing weight of a partially valid final action chunk. PI05 also retains
+its existing microbatch normalization by default. The legacy path adds no count
+exchange or extra collation pass and keeps its loss reporting.
+
+Explicitly set `[vla].objective_weighting` to `"episode"` or `"sample"` to opt in.
 A sample is one action chunk's scalar mean over its valid action components.
 Padding contributes neither a sample nor denominator mass. Episode weighting
 then averages these chunk objectives within each nonempty episode.
 
-This corrects PI05's sum of independently normalized microbatch means, whose
-gradient magnitude depended on `training_chunk_size`. Both trainers now use one
+The opt-in path corrects PI05's sum of independently normalized microbatch means,
+whose gradient magnitude depended on `training_chunk_size`. Both trainers use one
 objective window for the whole update. It also removes OpenVLA's division by zero
 for empty episodes and the second division of reported loss by episode count.
 Compared with the old OpenVLA element-weighted episode mean, a partially valid
 final chunk now has the same sample weight as another valid chunk. This is an
-intentional, explicit action-chunk definition, not token weighting.
+explicit opt-in action-chunk definition, not token weighting. It is not applied
+to existing configurations automatically.
 
-The fixed-rollout VLA loops have no expanded preflight to reuse. They exchange a
+The opted-in fixed-rollout VLA loops have no expanded preflight to reuse. They exchange a
 small count/shape report once per update within the DP mesh, then sum counts over
 the existing inter-replica communicator. This also aligns PI05's padded chunk
 count across DP ranks before FSDP forward/backward. The gradient scaling compensates
@@ -61,5 +68,7 @@ scheduler state, repeated mu iterations, uneven episodes, empty ranks, all-empty
 windows, filtering, fixed/dynamic schedules and prefetch on/off.
 `tests/test_vla_objective_weighting.py` executes the actual OpenVLA/PI05 loops with
 CPU model and clock substitutes to check both objectives at several chunk sizes
-and all-empty updates. These are numerical regressions, not full simulator/GPU
+and all-empty updates. Compatibility tests verify the default legacy formulas,
+partially valid final chunks, and absence of extra collation/count collectives
+when the new objective is unset. These are numerical regressions, not full simulator/GPU
 lifecycle validation.

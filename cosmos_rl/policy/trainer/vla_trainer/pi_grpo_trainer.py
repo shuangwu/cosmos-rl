@@ -66,12 +66,22 @@ class PI05GRPOTrainer(GRPOTrainer):
         policy_inputs = [
             self.data_packer.get_policy_input(r, self.device) for r in rollouts
         ]
-        max_chunks = max((p.chains.shape[0] for p in policy_inputs), default=1)
-        objective, global_count, gradient_divisor, max_chunks = vla_objective(
-            self,
-            (self.data_packer.policy_collate_fn(p, max_chunks) for p in policy_inputs),
-            inter_policy_nccl,
+        max_chunks = (
+            max(p.chains.shape[0] for p in policy_inputs)
+            if self.config.vla.objective_weighting is None
+            else max((p.chains.shape[0] for p in policy_inputs), default=1)
         )
+        objective = None
+        global_count = len(policy_inputs)
+        if self.config.vla.objective_weighting is not None:
+            objective, global_count, gradient_divisor, max_chunks = vla_objective(
+                self,
+                (
+                    self.data_packer.policy_collate_fn(p, max_chunks)
+                    for p in policy_inputs
+                ),
+                inter_policy_nccl,
+            )
         sample_offset = 0
         for policy_input in policy_inputs if global_count else ():
             episode_data = self.data_packer.policy_collate_fn(policy_input, max_chunks)
@@ -177,8 +187,6 @@ class PI05GRPOTrainer(GRPOTrainer):
                         policy_loss3 = torch.sign(advantage) * clip_ratio_c * advantage
                         policy_loss = torch.min(policy_loss, policy_loss3)
 
-                    sample_losses = masked_sample_means(policy_loss, loss_mask)
-
                     # Metrics
                     clip_mask = policy_loss1.detach() < policy_loss2.detach()
                     pg_clipfrac = (
@@ -187,13 +195,19 @@ class PI05GRPOTrainer(GRPOTrainer):
                     )
                     ppo_kl = -approx_kl.sum() / loss_mask_count
 
-                    loss = objective.loss(
-                        sample_losses,
-                        start=sample_offset,
-                        global_count=global_count,
-                        gradient_divisor=gradient_divisor,
-                    )
-                    sample_offset += sample_losses.numel()
+                    if objective is None:
+                        # Existing PI05 normalization remains the default.
+                        pg_loss = (policy_loss * response_mask).sum() / loss_mask_count
+                        loss = pg_loss / len(policy_inputs)
+                    else:
+                        sample_losses = masked_sample_means(policy_loss, loss_mask)
+                        loss = objective.loss(
+                            sample_losses,
+                            start=sample_offset,
+                            global_count=global_count,
+                            gradient_divisor=gradient_divisor,
+                        )
+                        sample_offset += sample_losses.numel()
                     loss.backward()
 
                     total_loss += loss.item()
@@ -205,10 +219,14 @@ class PI05GRPOTrainer(GRPOTrainer):
                         f"mask_sum={loss_mask_count}"
                         + (" [PADDED]" if loss_mask_count == 0 else "")
                     )
-        if global_count:
+        if objective is None or global_count:
             self.lr_schedulers.step()
         current_lr = self.lr_schedulers.get_last_lr()[0]
-        grad_norm = self.all_reduce_states(inter_policy_nccl) if global_count else 0.0
+        grad_norm = (
+            self.all_reduce_states(inter_policy_nccl)
+            if objective is None or global_count
+            else 0.0
+        )
 
         end_event.record()
         # NOTE: `CUDA error: device not ready` (or similar) here usually means an earlier CUDA
@@ -245,7 +263,9 @@ class PI05GRPOTrainer(GRPOTrainer):
             )
             report_data["train/learning_rate"] = float(current_lr)
             report_data["train/grad_norm"] = float(grad_norm)
-            report_data["train/loss_avg"] = float(total_loss)
+            report_data["train/loss_avg"] = float(
+                total_loss if objective is not None else total_loss / len(policy_inputs)
+            )
             report_data["train/loss_max"] = float(max_loss) if global_count else 0.0
             report_data["train_step"] = int(current_step)
 
