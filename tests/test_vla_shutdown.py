@@ -14,7 +14,7 @@ def test_vla_shutdown_is_safe_before_initialization_and_idempotent():
     rollout.env_manager = manager
     rollout.shutdown()
     rollout.shutdown()
-    manager.stop_simulator.assert_called_once_with()
+    manager.stop_simulator.assert_called_once_with(preserve_state=False)
 
 
 def test_sync_worker_shuts_down_engine_before_unregister():

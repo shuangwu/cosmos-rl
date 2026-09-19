@@ -140,7 +140,7 @@ class OpenVLARollout(RolloutBase):
         """Reap simulator children before Python joins them at process exit."""
         manager = getattr(self, "env_manager", None)
         if manager is not None:
-            manager.stop_simulator()
+            manager.stop_simulator(preserve_state=False)
             self.env_manager = None
 
     def post_init_hook(self, **kwargs):
