@@ -22,7 +22,11 @@ from cosmos_rl.dispatcher.data.schema import Rollout
 from cosmos_rl.policy.trainer.base import TrainerRegistry
 from cosmos_rl.utils.distributed import HighAvailabilitylNccl
 from cosmos_rl.utils.logging import logger
-from cosmos_rl.policy.trainer.objectives import masked_sample_means, vla_objective
+from cosmos_rl.policy.trainer.objectives import (
+    masked_sample_means,
+    vla_objective,
+    vla_objective_inputs,
+)
 
 
 @TrainerRegistry.register(trainer_type="grpo_vla")
@@ -98,10 +102,7 @@ class OpenVLAGRPOTrainer(GRPOTrainer):
         if self.config.vla.objective_weighting is not None:
             objective, global_count, gradient_divisor, max_chunks = vla_objective(
                 self,
-                (
-                    self.data_packer.policy_collate_fn(p, max_chunks)
-                    for p in policy_inputs
-                ),
+                vla_objective_inputs(self.data_packer, policy_inputs, max_chunks),
                 inter_policy_nccl,
             )
         sample_offset = 0

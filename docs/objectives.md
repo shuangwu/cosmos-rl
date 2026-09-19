@@ -59,10 +59,14 @@ remains a rank-local scaled contribution, not a newly reduced global metric.
 Existing fixed-rollout dispatch must provide matching episode slots within each
 DP replica. A zero-contribution rank uses fully masked episode slots, not missing
 slots; slot disagreement is detected before backward. This is not an automatic
-conversion of VLA to variable-slot expanded scheduling. Counts are obtained in a
-streaming collation pass, then each episode is collated for training; the change
-does not retain every padded episode simultaneously. Checkpoint behavior is kept
-even when an all-empty update skips optimization.
+conversion of VLA to variable-slot expanded scheduling. Built-in packers obtain
+counts in a streaming CPU mask-only pass, using the same mask construction as
+training collation. Images, observations and actions are not collated for counting;
+each trained episode is fully collated only once. No batch of padded episodes is
+retained. Custom packers without `policy_logprob_masks` keep the original collation
+fallback; a custom mask helper must exactly match that packer's training masks.
+Mask values/dtypes, padding and training losses are unchanged. Checkpoint behavior
+is kept even when an all-empty update skips optimization.
 
 ## Validation
 
@@ -82,3 +86,7 @@ and all-empty updates. Compatibility tests verify the default legacy formulas,
 partially valid final chunks, and absence of extra collation/count collectives
 when the new objective is unset. These are numerical regressions, not full simulator/GPU
 lifecycle validation.
+Mask-only preparation tests compare built-in training masks against independent
+legacy formulas, including partial final chunks and PI05 finish-step clamping.
+Loop tests assert one full collation per trained episode for both weighting modes
+and the default path, and no count preparation on the default path.

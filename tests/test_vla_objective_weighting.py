@@ -37,6 +37,11 @@ class Packer:
     def get_policy_input(self, rollout, device):
         return rollout
 
+    def policy_logprob_masks(self, policy_input, max_chunks, *, device=None):
+        return torch.arange(max_chunks, device=device).reshape(-1, 1) < len(
+            policy_input.values
+        )
+
     def policy_collate_fn(self, policy_input, max_chunks):
         values = torch.tensor(
             policy_input.values + [0.0] * (max_chunks - len(policy_input.values)),
@@ -56,6 +61,99 @@ class Packer:
             denoise_inds=values,
             old_log_probs=torch.zeros_like(values),
         )
+
+
+@pytest.mark.parametrize("kind", ["openvla", "pi05"])
+@pytest.mark.parametrize("finish_step", [0, 1, 2, 3, 6])
+@pytest.mark.parametrize("max_chunks", [3, 5])
+def test_builtin_mask_only_matches_training_collation(
+    monkeypatch, kind, finish_step, max_chunks
+):
+    from cosmos_rl.dispatcher.data.packer import vla_data_packer
+    from cosmos_rl.dispatcher.data.packer.pi05_data_packer import PI05DataPacker
+    from cosmos_rl.policy.trainer.objectives import vla_objective_inputs
+
+    monkeypatch.setattr(vla_data_packer, "_get_vla_constants", lambda: (2, 3, 100))
+    if kind == "openvla":
+        packer = object.__new__(vla_data_packer.VLADataPacker)
+        packer.tokenizer = SimpleNamespace(pad_token_id=0)
+        policy_input = SimpleNamespace(
+            finish_step=finish_step,
+            input_ids=torch.ones(3, 4, dtype=torch.long),
+            responses=torch.ones(3, 6, dtype=torch.long),
+            pixel_values=torch.ones(3, 2, 2),
+            old_log_probs=torch.ones(3, 6),
+        )
+        metadata = SimpleNamespace(finish_step=finish_step)
+        dtype = torch.long
+    else:
+        packer = object.__new__(PI05DataPacker)
+        policy_input = SimpleNamespace(
+            finish_step=finish_step,
+            chains=torch.ones(3, 2, 2, 3),
+            denoise_inds=torch.ones(3, 2, dtype=torch.long),
+            images=torch.ones(3, 1, 2, 2),
+            image_masks=torch.ones(3, 1, dtype=torch.bool),
+            states=torch.ones(3, 3),
+            tokenized_prompt=torch.ones(3, 4, dtype=torch.long),
+            tokenized_prompt_mask=torch.ones(3, 4, dtype=torch.bool),
+            old_log_probs=torch.ones(3, 2, 3),
+        )
+        # Count preparation needs only shape metadata, never tensor contents.
+        metadata = SimpleNamespace(
+            finish_step=finish_step, old_log_probs=SimpleNamespace(shape=(3, 2, 3))
+        )
+        dtype = torch.float32
+    original = packer.policy_collate_fn(policy_input, max_chunks)
+    # Independent pre-refactor mask formula, including a partial final chunk.
+    expected = (
+        torch.cat(
+            (torch.ones(finish_step, 3), torch.zeros(max_chunks * 2 - finish_step, 3))
+        )
+        .reshape(max_chunks, 6)
+        .to(dtype)
+    )
+    torch.testing.assert_close(original["logprob_masks"], expected)
+    packer.policy_collate_fn = Mock(side_effect=AssertionError("full collation"))
+    packer.policy_logprob_masks = Mock(wraps=packer.policy_logprob_masks)
+    data = list(vla_objective_inputs(packer, [metadata], max_chunks))[0]
+    torch.testing.assert_close(data["logprob_masks"], expected)
+    assert data["logprob_masks"].device.type == "cpu"
+    packer.policy_collate_fn.assert_not_called()
+
+
+def test_custom_packer_keeps_collation_fallback():
+    from cosmos_rl.policy.trainer.objectives import vla_objective_inputs
+
+    data = {"logprob_masks": torch.tensor([[False, True]])}
+    packer = SimpleNamespace(policy_collate_fn=Mock(return_value=data))
+    assert list(vla_objective_inputs(packer, ["episode"], 3)) == [data]
+    packer.policy_collate_fn.assert_called_once_with("episode", 3)
+
+
+def test_custom_collation_override_does_not_use_inherited_masks():
+    from cosmos_rl.policy.trainer.objectives import vla_objective_inputs
+
+    class CustomPacker(Packer):
+        def policy_collate_fn(self, policy_input, max_chunks):
+            return {"logprob_masks": torch.zeros(max_chunks, 1, dtype=torch.bool)}
+
+    packer = CustomPacker()
+    episode = SimpleNamespace(values=[1.0, 2.0])
+    data = list(vla_objective_inputs(packer, [episode], 3))[0]
+    assert not data["logprob_masks"].any()
+
+
+@pytest.mark.parametrize("finish_step,expected_steps", [(-1, 0), (9, 6)])
+def test_pi05_mask_preserves_finish_step_clamping(finish_step, expected_steps):
+    from cosmos_rl.dispatcher.data.packer.pi05_data_packer import PI05DataPacker
+
+    packer = object.__new__(PI05DataPacker)
+    metadata = SimpleNamespace(
+        finish_step=finish_step, old_log_probs=SimpleNamespace(shape=(3, 2, 3))
+    )
+    mask = packer.policy_logprob_masks(metadata, 3, device="cpu")
+    assert mask.sum().item() == expected_steps * 3
 
 
 @pytest.mark.parametrize("cls", [PI05GRPOTrainer, OpenVLAGRPOTrainer])
@@ -108,6 +206,9 @@ def test_production_objective_is_chunk_invariant(
     trainer.data_packer.policy_collate_fn = Mock(
         wraps=trainer.data_packer.policy_collate_fn
     )
+    trainer.data_packer.policy_logprob_masks = Mock(
+        wraps=trainer.data_packer.policy_logprob_masks
+    )
     trainer.parallel_dims = SimpleNamespace(dp_enabled=False)
     trainer.global_rank = 0
     trainer.config = SimpleNamespace(
@@ -156,11 +257,17 @@ def test_production_objective_is_chunk_invariant(
     assert trainer.model.weight.item() == pytest.approx(0.0 if empty else expected)
     assert trainer.all_reduce_states.call_count == (0 if empty else 1)
     assert trainer.lr_schedulers.last_epoch == (0 if empty else 1)
+    assert trainer.data_packer.policy_collate_fn.call_count == (
+        0 if empty else len(episodes)
+    )
     if weighting is None:
         # Default execution must not pay for the opt-in count/collation pass.
         assert trainer.data_packer.policy_collate_fn.call_count == len(episodes)
         comm.wait_comm_ready.assert_not_called()
         comm.allreduce.assert_not_called()
+        trainer.data_packer.policy_logprob_masks.assert_not_called()
+    else:
+        assert trainer.data_packer.policy_logprob_masks.call_count == len(episodes)
 
 
 @pytest.mark.parametrize("chunk_size", [1, 2, 3])

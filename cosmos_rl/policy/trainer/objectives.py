@@ -76,6 +76,28 @@ def masked_sample_means(losses, mask):
     return (sums / sizes.clamp_min(1))[sizes > 0]
 
 
+def vla_objective_inputs(packer, policy_inputs, max_chunks):
+    """Stream CPU masks only when supported; preserve custom packer fallback."""
+    masks = getattr(packer, "policy_logprob_masks", None)
+    if masks is not None:
+        definitions = [vars(packer)] + [vars(cls) for cls in type(packer).__mro__]
+        mask_owner = next(
+            i for i, attrs in enumerate(definitions) if "policy_logprob_masks" in attrs
+        )
+        collate_owner = next(
+            i for i, attrs in enumerate(definitions) if "policy_collate_fn" in attrs
+        )
+        # An existing custom collation override has not opted into its inherited
+        # mask helper. Its masks may differ: keep the old count path in that case.
+        if collate_owner < mask_owner:
+            masks = None
+    for policy_input in policy_inputs:
+        if masks is None:
+            yield packer.policy_collate_fn(policy_input, max_chunks)
+        else:
+            yield {"logprob_masks": masks(policy_input, max_chunks, device="cpu")}
+
+
 def vla_objective(trainer, episode_data, inter_policy_nccl):
     """Normalize one VLA update across its DP mesh and replica communicator.
 
