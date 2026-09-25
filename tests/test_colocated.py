@@ -27,8 +27,17 @@ from subprocess_helpers import wait_all_or_fail, wait_for_controller_ready
 
 class TestColocated(unittest.TestCase):
     def test_colocated(self):
+        self.run_colocated()
+
+    def test_final_step_healthy(self):
+        self.run_colocated("healthy")
+
+    def test_final_step_quality_refill(self):
+        self.run_colocated("reject-final-group")
+
+    def run_colocated(self, refill_case=None):
         cur_dir = os.path.dirname(os.path.abspath(__file__))
-        world_size = 4
+        world_size = 1 if refill_case else 4
         port = network_util.find_available_port(8123)
         config_path = os.path.join(
             cur_dir,
@@ -60,6 +69,12 @@ class TestColocated(unittest.TestCase):
         if "logging" not in config:
             config["logging"] = {}
         config["logging"]["logger"] = ["console"]
+        if refill_case:
+            config["train"]["max_num_steps"] = 3
+            config["train"]["train_batch_per_replica"] = 16
+            config["rollout"]["parallelism"]["dp_shard_size"] = world_size
+            config["policy"]["parallelism"]["dp_shard_size"] = world_size
+            config["validation"] = {"enable": False}
 
         with tempfile.NamedTemporaryFile(
             mode="w+", suffix=".toml", delete=False
@@ -96,11 +111,14 @@ class TestColocated(unittest.TestCase):
             "--rdzv_endpoint=localhost:0",
             os.path.join(cur_dir, "utils", "mock_policy_entrance.py"),
             "--test",
-            "colocated",
+            "colocated_final_step_refill" if refill_case else "colocated",
         ]
 
         policy_env = dict(os.environ)
-        policy_env["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+        policy_env["CUDA_VISIBLE_DEVICES"] = "0" if refill_case else "0,1,2,3"
+        if refill_case:
+            policy_env["COLOCATED_REFILL_CASE"] = refill_case
+            policy_env["COLOCATED_REFILL_TARGET"] = "1"
         # Start the process
         policy_process0 = subprocess.Popen(
             policy_cmd,
@@ -111,7 +129,10 @@ class TestColocated(unittest.TestCase):
         )
 
         policy_env = dict(os.environ)
-        policy_env["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
+        policy_env["CUDA_VISIBLE_DEVICES"] = "1" if refill_case else "4,5,6,7"
+        if refill_case:
+            policy_env["COLOCATED_REFILL_CASE"] = refill_case
+            policy_env["COLOCATED_REFILL_TARGET"] = "0"
         # Start the process
         policy_process1 = subprocess.Popen(
             policy_cmd,
