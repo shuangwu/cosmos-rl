@@ -7,6 +7,24 @@ class ResumeMetadataMismatch(ValueError):
     """The controller and worker cannot agree on resumable training state."""
 
 
+def controller_checkpoint_metadata(checkpoint: dict) -> dict:
+    """Separate trainer-owned reference state from the shared contract.
+
+    Trainers validate and consume these fields locally during restore. Reference
+    tensors can be rank-local and must not travel over the controller JSON API.
+    Do not filter unknown fields: application sampling/progress remains subject
+    to exact controller/worker agreement.
+    """
+    local_fields = {
+        "grpo_reference_enabled",
+        "grpo_reference_state",
+        "grpo_reference_reset_step",
+        "dpo_reference_policy",
+        "dpo_reference_state",
+    }
+    return {key: value for key, value in checkpoint.items() if key not in local_fields}
+
+
 def validate_resume_metadata(expected: dict, actual: dict) -> None:
     """Preserve exact agreement, reporting keys without leaking checkpoint data.
 

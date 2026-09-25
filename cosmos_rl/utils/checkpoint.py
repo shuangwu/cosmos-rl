@@ -23,6 +23,7 @@ import numpy as np
 import concurrent.futures as futures
 from cosmos_rl.utils.util import is_master_rank
 from cosmos_rl.utils.logging import logger
+from cosmos_rl.utils.resume import controller_checkpoint_metadata
 from cosmos_rl.utils.parallelism import ParallelDims
 from cosmos_rl.utils.s3_utils import upload_file_to_s3
 from cosmos_rl.policy.config import Config as CosmosConfig
@@ -762,7 +763,7 @@ class CheckpointMananger:
                     logger.info(
                         f"[Policy] Checkpoint extra info loaded successfully from {base_path}."
                     )
-                    return extra_vars
+                    return controller_checkpoint_metadata(extra_vars)
                 else:
                     raise FileNotFoundError(f"No checkpoint found at {base_path}")
             except Exception as e:
