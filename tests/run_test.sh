@@ -94,6 +94,17 @@ run python -c "import cosmos_rl, os; print('cosmos_rl imported from:', cosmos_rl
 
 # run tests
 run python -m pytest -q tests/test_high_availability_nccl_harness.py
+run python -m pytest -q tests/test_weight_adoption.py
+run python -m pytest -q tests/test_mpi_rank.py
+run python -m pytest -q tests/test_empty_rollout_batch.py
+run torchrun --standalone --nproc-per-node=2 tests/empty_rollout_batch_canary.py
+run python -m pytest -q tests/test_rollout_phase_boundaries.py
+run python -m pytest -q tests/test_r2r_command_selection.py
+run python -m pytest -q tests/test_multi_turn_termination.py
+run python -m pytest -q tests/test_multi_turn_distillation_guard.py
+run python -m pytest -q tests/test_async_rollout_phases.py
+run python -m pytest -q tests/test_async_generation_lifetime.py
+run python -m pytest -q tests/test_async_weight_pause.py
 run python -m pytest -q tests/test_sft_ack_progress.py
 run python -m pytest -q tests/test_trainer_batching_contract.py
 run python -m pytest -q tests/test_prepared_training_prefetch.py
@@ -169,6 +180,8 @@ run python tests/test_transport_strategy.py
 run python tests/test_prefetch_mixin.py
 run python tests/test_trajectory.py
 run python tests/test_rollout_prefetch_loop_integration.py
+run python -m pytest -q tests/test_generation_prefetch_cancellation.py
+run python -m pytest -q tests/test_generation_preparation_identity.py
 run python tests/test_ucxx_e2e.py
 run python tests/test_custom_class.py
 run python tests/test_math_verify.py
