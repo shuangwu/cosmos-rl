@@ -216,7 +216,11 @@ class Trainer(ABC):
         )
 
     def invalidate_checkpoint_completion(self, current_step: int) -> None:
-        """Invalidate this rank before a coordinated same-step final save."""
+        """Join pending state before final promotion (legacy hook name).
+
+        The checkpoint manager preserves committed state instead of invalidating
+        it. Final save verifies immutable state before reusing its artifacts.
+        """
         manager = getattr(self, "ckpt_manager", None)
         if manager is None or not hasattr(manager, "invalidate_completion_marker"):
             raise NotImplementedError(
