@@ -35,7 +35,7 @@ import numpy as np
 import torch
 
 from cosmos_rl.utils.logging import logger
-from cosmos_rl.utils.trajectory import EPISODE_LENGTH, VARLEN_FIELDS
+from cosmos_rl.utils.trajectory import truncate_trajectory
 from cosmos_rl.utils.payload_transport.strategy import PayloadTransportStrategy
 from cosmos_rl.utils.trace import get_trace_time
 from cosmos_rl.utils.payload_transport.ucxx.ucxx_buffer import (
@@ -466,16 +466,7 @@ class UCXXTransportStrategy(PayloadTransportStrategy):
                     else:
                         gpu_data[key] = value
 
-            ep_len_tensor = gpu_data.get(EPISODE_LENGTH)
-            if ep_len_tensor is not None:
-                ep_len = (
-                    int(ep_len_tensor.item())
-                    if ep_len_tensor.numel() == 1
-                    else int(ep_len_tensor[0].item())
-                )
-                for key in VARLEN_FIELDS:
-                    if key in gpu_data and gpu_data[key].shape[0] > ep_len:
-                        gpu_data[key] = gpu_data[key][:ep_len]
+            truncate_trajectory(gpu_data)
             return gpu_data
 
         meta_by_idx: dict = {}

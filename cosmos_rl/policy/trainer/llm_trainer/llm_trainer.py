@@ -31,6 +31,10 @@ from huggingface_hub.utils import disable_progress_bars, enable_progress_bars
 from cosmos_rl.utils.s3_utils import upload_folder_to_s3
 
 from cosmos_rl.utils.logging import logger
+from cosmos_rl.utils.tensor_packing import (
+    pack_tensors_into_buffer,
+    unpack_tensors_from_buffer,
+)
 from cosmos_rl.policy.trainer.optm import build_optimizers
 from cosmos_rl.policy.model import ModelRegistry
 from cosmos_rl.policy.config import Config as CosmosConfig
@@ -387,20 +391,10 @@ class LLMTrainer(Trainer):
                     self._p2p_sync_packed_buffer = packed_buffer
                 payload = packed_buffer[:pending_bytes]
                 if is_send:
-                    offset = 0
-                    for tensor in tensors:
-                        tensor_bytes = tensor.view(-1).view(torch.uint8)
-                        end = offset + tensor_bytes.numel()
-                        payload[offset:end].copy_(tensor_bytes)
-                        offset = end
+                    pack_tensors_into_buffer(tensors, payload)
                 active_hook(payload)
                 if not is_send:
-                    offset = 0
-                    for tensor in tensors:
-                        tensor_bytes = tensor.view(-1).view(torch.uint8)
-                        end = offset + tensor_bytes.numel()
-                        tensor_bytes.copy_(payload[offset:end])
-                        offset = end
+                    unpack_tensors_from_buffer(payload, tensors)
                     unpacked_on_cuda = tensors[0].is_cuda
             else:
                 batch_hook(tensors)
