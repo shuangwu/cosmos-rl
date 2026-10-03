@@ -159,8 +159,8 @@ class TestStopCommandSerialization(unittest.TestCase):
 class TestStopCommandHandler(unittest.TestCase):
     """``handle_stop`` must break ``main_loop`` out of *any* branch -- a
     normal drain, an empty queue, or the weight-version-gate spin that no
-    longer clears once weight syncs stop -- by setting both shutdown
-    signals.  It must not touch NCCL (the whole point of the redis-channel
+    longer clears once weight syncs stop -- by stopping main-loop work but
+    retaining teardown liveness. It must not touch NCCL (the redis-channel
     delivery)."""
 
     @staticmethod
@@ -171,12 +171,12 @@ class TestStopCommandHandler(unittest.TestCase):
             shutdown_mp_signal=threading.Event(),
         )
 
-    def test_sets_both_shutdown_signals(self):
+    def test_stops_work_but_retains_teardown_heartbeat(self):
         worker = self._worker()
         self.assertFalse(worker.shutdown_signal.is_set())
         DisaggregatedRolloutControlWorker.handle_stop(worker, StopCommand("replica-0"))
         self.assertTrue(worker.shutdown_signal.is_set())
-        self.assertTrue(worker.shutdown_mp_signal.is_set())
+        self.assertFalse(worker.shutdown_mp_signal.is_set())
 
 
 class TestShouldBroadcastStop(unittest.TestCase):
@@ -1062,6 +1062,7 @@ class TestJobPhaseWeightSync(unittest.TestCase):
         ended = SimpleNamespace(status=SimpleNamespace(ended=True), start_time=1.0)
         psm = SimpleNamespace(
             job_phase=JobPhase.RUNNING,
+            data_fetcher=SimpleNamespace(activated_val_iter=object()),
             total_steps=2,
             config=SimpleNamespace(
                 train=SimpleNamespace(sync_weight_interval=1),
@@ -1086,6 +1087,7 @@ class TestJobPhaseWeightSync(unittest.TestCase):
         ended = SimpleNamespace(status=SimpleNamespace(ended=True), start_time=1.0)
         psm = SimpleNamespace(
             job_phase=JobPhase.RUNNING,
+            data_fetcher=SimpleNamespace(activated_val_iter=None),
             total_steps=2,
             config=SimpleNamespace(
                 train=SimpleNamespace(sync_weight_interval=1),
@@ -1101,6 +1103,47 @@ class TestJobPhaseWeightSync(unittest.TestCase):
             PolicyStatusManager.should_weight_sync_after_train_ack.__get__(psm)
         )
         self.assertFalse(psm.should_weight_sync_after_train_ack(1, rsm))
+
+    def test_active_validation_sync_after_prompt_exhaustion(self):
+        # Exhausting training prompts must not strand an active validation
+        # sampler, even before the final step or without an explicit stop.
+        for phase in (JobPhase.RUNNING, JobPhase.DRAINING):
+            for step in (1, 2):
+                for targets in ([object()], []):
+                    with self.subTest(phase=phase, step=step, targets=bool(targets)):
+                        psm = object.__new__(PolicyStatusManager)
+                        psm.job_phase = phase
+                        psm.stop_reason = None
+                        psm.total_steps = 2
+                        psm.config = SimpleNamespace(
+                            train=SimpleNamespace(sync_weight_interval=1),
+                            validation=SimpleNamespace(enable=True, freq=1),
+                        )
+                        psm.data_fetcher = SimpleNamespace(activated_val_iter=object())
+                        rsm = SimpleNamespace(
+                            all_rollouts_ended=lambda: True,
+                            get_safe_weight_sync_replicas=lambda **kwargs: targets,
+                        )
+                        self.assertEqual(
+                            psm.should_weight_sync_after_train_ack(step, rsm),
+                            bool(targets),
+                        )
+
+    def test_inactive_validation_does_not_restart_drained_rollouts(self):
+        for phase in (JobPhase.RUNNING, JobPhase.DRAINING):
+            for step in (1, 2):
+                with self.subTest(phase=phase, step=step):
+                    psm = object.__new__(PolicyStatusManager)
+                    psm.job_phase = phase
+                    psm.stop_reason = None
+                    psm.total_steps = 2
+                    psm.config = SimpleNamespace(
+                        train=SimpleNamespace(sync_weight_interval=1),
+                        validation=SimpleNamespace(enable=True, freq=1),
+                    )
+                    psm.data_fetcher = SimpleNamespace(activated_val_iter=None)
+                    rsm = SimpleNamespace(all_rollouts_ended=lambda: True)
+                    self.assertFalse(psm.should_weight_sync_after_train_ack(step, rsm))
 
 
 class TestJobPhaseValidationBypass(unittest.TestCase):
