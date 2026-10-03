@@ -14,13 +14,12 @@
 # limitations under the License.
 
 from typing import List, Optional, Callable, Any, Type, Union
-from itertools import chain
+from itertools import chain, zip_longest
 from numbers import Real
 from cosmos_rl.dispatcher.controller import Controller
 from cosmos_rl.dispatcher.replica import Replica
 from cosmos_rl.dispatcher.protocol import Role, RolloutRequest
 from cosmos_rl.utils.logging import logger
-from cosmos_rl.utils.util import is_master_rank
 import cosmos_rl.utils.network_util as network_util
 import torch
 from torch.utils.data import Dataset
@@ -46,6 +45,9 @@ from cosmos_rl.dispatcher.command import (
     PolicyToPolicyBroadcastCommand,
 )
 import numpy as np
+import time
+from queue import Empty
+from cosmos_rl.utils import constant
 from cosmos_rl.utils.payload import extract_rollouts
 from cosmos_rl.utils.util import RollingDict
 from cosmos_rl.policy.model.hf_models import HFModel
@@ -148,6 +150,7 @@ class ColocatedController(Controller):
         self.config = config
         self.policy = policy
         self.rollout = rollout
+        self._unreported_rollouts = []
         task_type = config.train.train_policy.type
         self.policy_to_rollout_shard_mapper = ParallelizedShardMapper.get_instance(
             config
@@ -276,7 +279,13 @@ class ColocatedController(Controller):
         if isinstance(data_fetch_cmd, TrainingCompleteCommand):
             self.finish_requested_stop(data_fetch_cmd)
             return False
-        self.rollout_consume_one_step_commands_util_r2r()
+        # DataFetch describes the next optimizer update. Initial colocated
+        # weight commands must describe the restored, already-completed update,
+        # before any rollout can be generated or validation can be selected.
+        self.current_step = data_fetch_cmd.global_step - 1
+        self.total_steps = data_fetch_cmd.total_steps
+        if not self.rollout_consume_one_step_commands_util_r2r(initial=True):
+            return False
         assert isinstance(data_fetch_cmd, DataFetchCommand)
         self.init_data_fetch_command = data_fetch_cmd
         return True
@@ -319,7 +328,7 @@ class ColocatedController(Controller):
                     f"Unexpected command {cmd}"
                 )
 
-    def rollout_consume_one_step_commands_util_r2r(self) -> bool:
+    def rollout_consume_one_step_commands_util_r2r(self, *, initial=False) -> bool:
         """
         Consume one step commands for rollout replica until RolloutToRolloutBroadcastCommand is received.
         Skips all commands and return until RolloutToRolloutBroadcastCommand is encountered.
@@ -341,7 +350,8 @@ class ColocatedController(Controller):
             return False
 
         # All replicas have been reduced, trigger allreduce
-        need_sync_weight = step % self.config.train.sync_weight_interval == 0
+        # Startup must bind restored weights even between periodic sync steps.
+        need_sync_weight = initial or step % self.config.train.sync_weight_interval == 0
         # If the current step is the last step, we need to sync weight always to act as ending signal
         need_sync_weight = need_sync_weight or step == self.total_steps
         # If validation is enabled, we need to sync weight every validation step
@@ -376,6 +386,8 @@ class ColocatedController(Controller):
                 weight_step=self.current_step,
                 total_steps=self.total_steps,
                 redis_handler=self.command_dispatcher,
+                validation_round_id=cmd.validation_round_id,
+                validation_protocol_version=cmd.validation_protocol_version,
             )
         return need_sync_weight
 
@@ -383,6 +395,31 @@ class ColocatedController(Controller):
         """
         Advance the training iteration for new iteration of rollout and policy.
         """
+        if self.config.train.train_policy.on_policy:
+            # A parallel generation wave can exceed one training batch. In
+            # strict on-policy mode, its surplus cannot cross an optimizer
+            # update. Callbacks have drained at the iteration boundary; keep
+            # only this completed policy version, preserving FIFO order.
+            retained = []
+            discarded = 0
+            while True:
+                try:
+                    sample = self.policy.data_queue.get_nowait()
+                except Empty:
+                    break
+                if sample.weight_version == self.current_step:
+                    retained.append(sample)
+                else:
+                    discarded += 1
+            for sample in retained:
+                self.policy.data_queue.put_nowait(sample)
+            if discarded:
+                logger.info(
+                    "[Controller] Discarded %d non-current on-policy rollouts "
+                    "before update %d",
+                    discarded,
+                    self.current_step + 1,
+                )
         self.train_report_data[self.current_step] = {}
         self.current_step += 1
 
@@ -566,17 +603,27 @@ class ColocatedController(Controller):
             for rollout in rollouts:
                 self.policy.data_queue.put_nowait(rollout)
         else:
+            # Reward callbacks are rank-local and can report different numbers
+            # of groups, including zero. Collect only at the explicit boundary
+            # after every rank drains its callbacks, not inside each callback.
+            self._unreported_rollouts.append(rollouts)
+
+    def synchronize_rollouts(self):
+        if not self.config.train.train_policy.uncentralized_training:
             gathered_rollouts = dist_util.all_gather_object_cpu(
-                rollouts,
+                self._unreported_rollouts,
                 device=torch.device("cpu"),
                 group=self.rollout.parallel_dims.mesh["dp"].get_group(),
             )
-            rollouts = [rollout for sublist in gathered_rollouts for rollout in sublist]
-            if len(rollouts) > 0:
-                logger.debug(
-                    f"[RolloutGroup] from replica: {rollout_request.src_replica_name} with {len(rollout_request.payloads)} samples:"
-                    f"example: rollouts[0]\n{rollouts[0]}"
-                )
+            # Preserve the old callback-major, then rank-major ordering for
+            # healthy input. Missing reports contribute no fabricated samples.
+            rollouts = [
+                rollout
+                for reports in zip_longest(*gathered_rollouts, fillvalue=())
+                for report in reports
+                for rollout in report
+            ]
+            self._unreported_rollouts.clear()
             assert self.rollout.parallel_dims.cp_coord[1] == 1, (
                 "Colocated rollout worker only supports cp size 1."
             )
@@ -596,7 +643,10 @@ class ColocatedController(Controller):
         """
         local_pending = self.pending_policy_samples()
         if self.config.train.train_policy.uncentralized_training:
-            return local_pending * self.policy.world_size
+            # This is the minimum available batch capacity, not an estimate
+            # from one rank. Every rank must take the same refill/train branch.
+            counts = dist_util.all_gather_object_cpu(local_pending)
+            return min(counts) * self.policy.world_size
         else:
             if self.policy.global_rank != 0:
                 assert self.pending_policy_samples() == 0, (
@@ -605,6 +655,53 @@ class ColocatedController(Controller):
             return dist_util.broadcast_object_cpu(
                 local_pending, src=0, device=torch.device("cpu")
             )
+
+    def agree_prepared_batch(self, ready: bool) -> bool:
+        """All replicas wait before executing the already-issued DataFetch."""
+        command = getattr(self, "init_data_fetch_command", None)
+        if command is None:
+            command = self.next_data_fetch_command
+        decision, error = None, None
+        if self.policy.global_rank == 0:
+            try:
+                deadline = time.monotonic() + constant.COSMOS_ROLLOUT_CMD_WAIT_TIMEOUT
+                while True:
+                    decision = self.policy.api_client.colocated_preparation(
+                        self.policy.replica_name,
+                        command.global_step,
+                        command.total_steps,
+                        ready,
+                    )
+                    if decision in {"train", "stop"}:
+                        break
+                    if decision != "wait":
+                        raise RuntimeError(f"Invalid preparation decision: {decision}")
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Colocated preparation agreement timed out")
+                    time.sleep(0.05)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+        decision, error = dist_util.broadcast_object_cpu((decision, error))
+        if error is not None:
+            raise RuntimeError(error)
+        if decision == "train":
+            return True
+        # This command never reached the trainer. Drain its inputs and consume
+        # the controller's terminal command directly, bypassing the old fake ACK.
+        for attr in ("init_data_fetch_command", "next_data_fetch_command"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        self._unreported_rollouts.clear()
+        while True:
+            try:
+                self.policy.data_queue.get_nowait()
+            except Empty:
+                break
+        terminal = self.policy_consume_one_step_commands_util_data_fetch()
+        if not isinstance(terminal, TrainingCompleteCommand):
+            raise RuntimeError("Expected completion after colocated exhaustion")
+        self.finish_requested_stop(terminal)
+        return False
 
     def get_policy_model(self) -> Any:
         """
@@ -615,17 +712,3 @@ class ColocatedController(Controller):
         if isinstance(self.policy.trainer.model, HFModel):
             return self.policy.trainer.model.model
         return self.policy.trainer.model
-
-    def training_end_ack(self):
-        """
-        Send the training end acknowledgment to the controller.
-        Args:
-        """
-        if is_master_rank(self.policy.parallel_dims, self.policy.global_rank):
-            self.policy.api_client.post_policy_train_ack(
-                self.policy.replica_name,
-                self.current_step - 1,
-                self.current_step - 1,
-                False,
-                {},
-            )
