@@ -16,6 +16,8 @@
 import time
 from cosmos_rl.utils import constant
 import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 from datetime import datetime
 from cosmos_rl.utils.constant import (
     RedisStreamConstant,
@@ -61,7 +63,24 @@ class RedisStreamHandler:
         self.redis_clients = []
         for ip in ips:
             self.redis_clients.append(
-                redis.Redis(host=ip, port=self.port, db=0, decode_responses=False)
+                redis.Redis(
+                    host=ip,
+                    port=self.port,
+                    db=0,
+                    decode_responses=False,
+                    # A server-side BLOCK timeout does not bound a stalled
+                    # socket read. Producers must return to their stop checks.
+                    socket_timeout=max(
+                        RedisStreamConstant.CMD_READING_TIMEOUT_MS,
+                        RedisStreamConstant.ROLLOUT_READING_TIMEOUT_MS,
+                        RedisStreamConstant.TEACHER_REQUEST_READING_TIMEOUT_MS,
+                    )
+                    / 1000
+                    + 1,
+                    socket_connect_timeout=2,
+                    retry=Retry(NoBackoff(), 0),
+                    protocol=2,
+                )
             )
         self.latest_id_command = "0-0"
         self.latest_id_rollout = "0-0"
@@ -276,6 +295,7 @@ class RedisStreamHandler:
             logger.error(
                 f"[Redis] Failed to read from Redis stream {stream_name}_rollout: {e}"
             )
+            raise
         rollouts = []
         if messages:
             for _, message_list in messages:
@@ -391,13 +411,15 @@ class RedisStreamHandler:
                     block=RedisStreamConstant.TEACHER_REQUEST_READING_TIMEOUT_MS,
                 ),
                 response_parser=None,
-                max_retries=COSMOS_HTTP_RETRY_CONFIG.max_retries,
+                max_retries=COSMOS_HTTP_STREAM_POLL_MAX_RETRY,
             )
         except Exception as e:
-            messages = []  # return empty list if failed to read from Redis stream
+            if self._is_polling_read_miss(e):
+                return []
             logger.error(
                 f"[Redis] Failed to read from Redis stream teacher_request: {e}"
             )
+            raise
         teacher_requests = []
         if messages:
             for _, message_list in messages:

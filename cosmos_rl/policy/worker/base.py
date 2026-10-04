@@ -28,6 +28,7 @@ from cosmos_rl.utils.model_config import load_model_config
 from cosmos_rl.dispatcher.protocol import Role
 from cosmos_rl.utils.profiler import CosmosProfiler
 from cosmos_rl.utils.dist_signal_handler import DistributedSignalHandler
+from cosmos_rl.utils.worker_threads import stop_worker_threads
 
 
 class PolicyWorkerBase(WorkerBase, CommMixin):
@@ -189,6 +190,7 @@ class PolicyWorkerBase(WorkerBase, CommMixin):
                     ckpt_manager.finalize()
                 except Exception as e:
                     logger.error(f"Failed to finalize checkpoint manager: {e}")
+            stop_worker_threads(self)
             self.close_payload_transports()
             self.destroy_worker()
 
