@@ -66,3 +66,17 @@ def convert_weight_from_hf(
             shard = shard[start_idx:end_idx]
 
     return dest_name, shard.contiguous()
+
+
+def normalize_vla_checkpoint_keys(state_dict, model_keys):
+    """Accept both upstream HF names and Cosmos VLA wrapper export names."""
+    model_keys = set(model_keys)
+    normalized = {}
+    for name, tensor in state_dict.items():
+        target = name
+        if name.startswith("model.") and name[6:] in model_keys:
+            target = name[6:]
+        if target in normalized:
+            raise ValueError(f"Ambiguous VLA checkpoint entries for {target}")
+        normalized[target] = tensor
+    return normalized

@@ -106,3 +106,30 @@ def test_initial_colocated_replicas_share_epoch_save_decision_and_metadata():
         28,
     ]
     manager.check_checkpoint_saving.assert_called_once_with(32)
+
+
+def test_resume_does_not_queue_disabled_initial_validation():
+    from cosmos_rl.dispatcher.status import PolicyStatusManager
+
+    for before_train in (False, True):
+        fetcher = Mock()
+        manager = SimpleNamespace(recompute_total_steps=Mock(), total_steps=20)
+        config = SimpleNamespace(
+            train=SimpleNamespace(resume="step_10"),
+            validation=SimpleNamespace(
+                enable=True, val_before_train=before_train, freq=5
+            ),
+        )
+        PolicyStatusManager.setup(
+            manager,
+            config,
+            Mock(),
+            fetcher,
+            remain_samples_num=100,
+            samples_per_epoch=32,
+            current_step=10,
+        )
+        if before_train:
+            fetcher.validation_activate_dataloader.assert_called_once_with(10)
+        else:
+            fetcher.validation_activate_dataloader.assert_not_called()

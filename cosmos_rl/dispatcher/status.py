@@ -417,6 +417,7 @@ class PolicyStatusManager:
         if (
             self.config.train.resume
             and self.config.validation.enable
+            and self.config.validation.val_before_train
             and self.current_step > 0
             and (
                 self.current_step % self.config.validation.freq == 0
@@ -2816,8 +2817,8 @@ class RolloutStatusManager:
                 dst_replica=target_replica,
                 src_replica_size=policy_status_manager.policy_atoms_in_replica,
                 dst_replica_size=self.rollout_atoms_in_replica,
-                weight_step=None,
-                total_steps=None,
+                weight_step=policy_status_manager.current_step,
+                total_steps=policy_status_manager.total_steps,
                 redis_handler=self.redis_handler,
             )
             logger.info(
