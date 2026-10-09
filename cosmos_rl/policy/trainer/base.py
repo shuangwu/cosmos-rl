@@ -104,6 +104,33 @@ def extract_from_cuda_tensor(device, key, obj, tensor):
 
 
 class Trainer(ABC):
+    def payload_prefetch_optimizers(self):
+        """Optimizers to observe without changing their update decisions.
+
+        Custom trainers with another optimizer layout may override this hook.
+        No count is fabricated when the layout is unknown or replaced mid-step.
+        """
+        optimizer = getattr(self, "optimizer", None)
+        if isinstance(optimizer, torch.optim.Optimizer):
+            return (optimizer,)
+        container = getattr(self, "optimizers", None)
+        if isinstance(container, torch.optim.Optimizer):
+            return (container,)
+        values = getattr(container, "optimizers", ())
+        if all(isinstance(item, torch.optim.Optimizer) for item in values):
+            return tuple(values)
+        return ()
+
+    def training_payload_streams(self):
+        """Extra CUDA streams that read this command's payloads.
+
+        Managed prefetch already fences the worker training/current streams.
+        Custom trainers must declare other readers and drop payload aliases
+        before returning from their training method. Returning does not grant
+        permission to keep using a released batch in a background task.
+        """
+        return ()
+
     # Expansion is opt-in and enforced by the policy worker's step entrypoint.
     batching_contract = FixedRolloutBatching()
 

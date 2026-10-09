@@ -102,6 +102,11 @@ run python -m pytest -q tests/test_dispatch_staleness.py
 run python -m pytest -q tests/test_running_dispatch_barrier.py
 run python -m pytest -q tests/test_trainer_batching_contract.py
 run python -m pytest -q tests/test_prepared_training_prefetch.py
+run python -m pytest -q tests/test_trainer_payload_prefetch.py
+run python -m pytest -q tests/test_trainer_prefetch_lifecycle.py
+run python -m pytest -q tests/test_trainer_prefetch_notifications.py
+run python -m pytest -q tests/test_trainer_prefetch_publication.py
+run torchrun --standalone --nproc-per-node=4 tests/trainer_prefetch_cohort_canary.py --cpu
 run python -m pytest -q tests/test_nccl_prefetch_failfast.py
 run torchrun --standalone --nproc-per-node=2 tests/trainer_batching_canary.py --cpu
 run python tests/test_apex.py
