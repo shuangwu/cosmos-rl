@@ -131,6 +131,110 @@ It cannot be converted into a retryable HTTP error or leave a poisoned controlle
 alive. Atomic validation errors remain ordinary errors before mutation. Process
 restart and cross-node scheduler cancellation remain deployment responsibilities.
 
+## Application reward callbacks
+
+Custom `BaseDataPacker` implementations may override two optional methods:
+
+```python
+def annotate_reward_result(self, payload, result):
+    # Original group order, including members excluded from training.
+    return [
+        {"sample": payload.prompt_idx, "slot": slot,
+         "admitted": slot in result.selected_indices}
+        for slot in range(len(result.rewards))
+    ]
+
+def on_reward_read_complete(self, payload, *, is_validation, error):
+    # Finish any application asynchronous readers before returning.
+    self.reward_views.pop(payload.prompt_idx, None)
+```
+
+Annotation runs once after native rewards, admission and advantages have been
+computed. `RewardResult` contains tuples in original completion order: rewards,
+filter rewards, advantages (`None` for rejected members), and borrowed report
+metrics. `selected_indices` identifies native admitted members, or an empty tuple
+when the group is insufficient. Selection precedes whole-group dynamic sampling;
+this callback does not promise eventual policy consumption. Treat the payload
+and native result as read-only. Annotations cannot change rewards, advantages,
+admission, reservations, replacement capacity or training counters. Continue to
+make application quality decisions in the producer's completion mask.
+
+Return `None` for no annotations, or a list of dictionaries with one entry per
+original slot. Each dictionary must contain only finite JSON primitives, with
+string keys, at most 4096 encoded bytes, eight nesting levels and 1024 nodes.
+The complete group's diagnostic envelope is limited to 65536 bytes. Values are
+copied without invoking arbitrary serializers. Tensors, arrays, object handles
+and transport leases are rejected; native producer-owned reports are unchanged.
+Do not use annotations to retain borrowed payloads or native report objects.
+
+The selected payload carries `completion_diagnostics`, whose `original_index`
+survives selection. Its `rejected_completion_diagnostics` retains excluded slots
+even when the group has no selected members. With identified reporting,
+`RolloutRequest.completion_diagnostics` aligns with its accepted identities and
+each `CompletionFailure.diagnostics` carries the corresponding rejected member.
+These detached diagnostics survive removal of a rejected group from report
+payloads, and identity/order remain aligned across serialization and HTTP retry.
+
+Pass `hook_fns={"completion_settled": observer}` to the controller to observe
+identified admission. The synchronous observer receives a tuple of
+`CompletionSettlement` events with source replica/rank, stable identity, native
+disposition and optional detached diagnostics. It receives no payload, controller
+or settlement operation. Native accounting, cleanup and replay-window commit
+complete before invocation. Duplicate identities and late cleanup-only payloads
+produce no additional event, including reordered or all-rejected reports. An
+accepted disposition means native admission, with final policy buffering and
+outdated filtering still owned by the controller. Observer failure poisons
+admission and follows the existing fatal controller path (exit 86); accounting
+is already committed and must never be repeated to repair observer failure.
+Applications needing durable delivery must persist events in their observer;
+this is not an exactly-once journal across controller restart.
+
+Reward annotation and final reward-reader cleanup work in colocated and
+disaggregated modes, for local, remote and bypassed rewards. Identified settlement
+observation retains the native disaggregated non-DAPO restriction above.
+Colocated callbacks expose the native admission result and detached diagnostics;
+they do not provide a per-identity controller settlement event. A colocated
+consumer must capture rejected diagnostics in its annotation callback before
+native reporting removes a fully rejected payload.
+
+The final-reader callback runs in a `finally` boundary after evaluation and
+annotations, including native reward/advantage, annotation and preprocessing
+failures. Each submitted group's original payload is passed, including groups
+not evaluated because an earlier group failed. Cleanup must finish synchronous
+and asynchronous application reads, release only application reward-owned views,
+and tolerate repeated calls. Trainable colocated completion views, policy leases
+and transport ownership remain live until their respective final readers finish.
+Hooks execute in the reward calculator's process/thread (or the calling process
+for bypass), so application caches must belong to that execution context.
+Tasks canceled before starting notify the submitting role's packer with
+`CancelledError`; they have no calculator-process readers. Submission failures
+also finish all groups that have not been submitted.
+
+An annotation or cleanup failure fails its reward task. Cleanup attempts every
+submitted group even if one cleanup callback fails; an original evaluation error
+is preserved and secondary cleanup errors are logged. Remote transport errors,
+server failures and rate limits retain readers for polling. Invalid response
+content, mismatched completion counts, nonretryable HTTP failures and annotation
+errors terminate the evaluation and clean pending readers with that original
+error. Remote dispatcher shutdown waits for active readers and calls idempotent
+`close`, notifying remaining pending groups with `CancelledError`. If that close
+cannot complete within the shutdown budget, or canceled-reader cleanup fails,
+the role retains its resources using the existing shutdown failure behavior.
+
+Validation ignores training masks, exposes every original slot, uses the
+validation data packer's annotation and cleanup callbacks, and carries accepted
+diagnostics in validation payloads. Validation has no training identities,
+replacement capacity or `completion_settled` events.
+
+`tests/test_reward_callbacks.py` covers detached metadata, partial/insufficient/
+all-rejected groups, original slots, native reward/advantage call counts,
+custom-packer reward/policy ownership, repeated cleanup, local/remote/bypass and
+error/close behavior, replay suppression and required-observer failure.
+`tests/test_completion_admission_modes.py` exercises annotations and cleanup
+through real disaggregated and both colocated reporting/ingestion paths. These
+CPU regressions do not certify application-specific CUDA streams or distributed
+transport implementations; those integrations must test their own final readers.
+
 ## Downstream adoption
 
 Applications should decide quality while producing the completion group and

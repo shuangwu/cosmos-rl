@@ -4,6 +4,7 @@
 
 from cosmos_rl.dispatcher.data.admission import (
     CompletionDisposition,
+    CompletionSettlement,
     SourceWindow,
 )
 from cosmos_rl.reward.admission import COMPLETION_ADMISSION_METRIC_PREFIX
@@ -45,6 +46,12 @@ class CompletionAdmissionState:
         identities = request.completion_identities
         if identities is None or len(identities) != len(rollouts):
             raise ValueError("Admission requires one identity per completion")
+        if request.completion_diagnostics is not None and len(
+            request.completion_diagnostics
+        ) != len(identities):
+            raise ValueError(
+                "Admission requires diagnostics to match completion identities"
+            )
         if "discarded_samples" in request.metrics or any(
             key.startswith(COMPLETION_ADMISSION_METRIC_PREFIX)
             for key in request.metrics
@@ -188,6 +195,32 @@ class CompletionAdmissionState:
                 metric = f"application_rejected/{reason}"
                 status.filter_records[metric] = status.filter_records.get(metric, 0) + 1
             window.commit(identities)
+            observer = getattr(status, "hook_fns", {}).get("completion_settled")
+            if observer is not None and decisions:
+                diagnostics = {
+                    identity.sequence: diagnostic
+                    for identity, diagnostic in zip(
+                        request.completion_identities,
+                        request.completion_diagnostics
+                        or [None] * len(request.completion_identities),
+                    )
+                }
+                diagnostics.update(
+                    (failure.identity.sequence, failure.diagnostics)
+                    for failure in request.completion_failures
+                )
+                observer(
+                    tuple(
+                        CompletionSettlement(
+                            source_replica=request.src_replica_name,
+                            source_rank=request.src_global_rank,
+                            identity=identity,
+                            disposition=disposition,
+                            diagnostics=diagnostics.get(identity.sequence),
+                        )
+                        for identity, _, disposition in decisions
+                    )
+                )
             return accepted
         except BaseException:
             self.failed = True

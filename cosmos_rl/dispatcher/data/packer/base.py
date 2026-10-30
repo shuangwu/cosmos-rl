@@ -110,6 +110,26 @@ class BaseDataPacker(ABC):
         """
         return items
 
+    def annotate_reward_result(self, payload, result):
+        """Optionally return detached diagnostics in original completion order.
+
+        Called after native reward, advantage and admission computation. Treat
+        payload/result as borrowed read-only views; return a list of small JSON
+        dictionaries, one per original slot, or None. See reward.callbacks.
+        This hook cannot change native training eligibility or accounting.
+        """
+        return None
+
+    def on_reward_read_complete(self, payload, *, is_validation: bool, error):
+        """Finish application reward readers on success and failure.
+
+        Release only reward-owned views, retaining anything policy or transport
+        readers still need. Synchronize asynchronous application readers here.
+        Implementations must tolerate repeated cleanup. A cleanup error fails
+        the reward task unless an earlier reward/annotation error is active.
+        """
+        pass
+
     def get_rollout_output(
         self,
         completions: List[Any],
