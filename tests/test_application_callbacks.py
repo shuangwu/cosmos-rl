@@ -71,6 +71,76 @@ def test_factory_creates_once_per_execution_worker_with_explicit_context():
     registry.close()
 
 
+def test_new_threads_never_reuse_an_old_worker_factory_context():
+    contexts = []
+
+    def create(context):
+        contexts.append(context)
+        return lambda: context.worker_id
+
+    registry = CallbackRegistry(
+        {"read": CallbackFactory(create)}, CallbackContext(role="reward")
+    )
+    identities = []
+    for _ in range(8):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            identities.append(pool.submit(registry.invoke, "read").result())
+    assert len(contexts) == len(set(identities)) == 8
+    registry.close()
+
+
+_FORK_REGISTRY = None
+_FORK_EVIDENCE_PATH = None
+
+
+class _ProcessHandler:
+    def __init__(self, context):
+        self.context = context
+        with open(_FORK_EVIDENCE_PATH, "a") as evidence:
+            evidence.write(f"created {os.getpid()} {context.process_id}\n")
+
+    def __call__(self):
+        return self.context.process_id
+
+    def close(self):
+        with open(_FORK_EVIDENCE_PATH, "a") as evidence:
+            evidence.write(f"closed {os.getpid()} {self.context.process_id}\n")
+
+
+def _process_invoke():
+    return _FORK_REGISTRY.invoke("read")
+
+
+def test_factory_binds_and_closes_in_process_worker_after_parent_initialization(
+    tmp_path,
+):
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing
+
+    global _FORK_REGISTRY, _FORK_EVIDENCE_PATH
+    context = multiprocessing.get_context("fork")
+    _FORK_EVIDENCE_PATH = tmp_path / "factory_lifetime.txt"
+    _FORK_REGISTRY = CallbackRegistry(
+        {"read": CallbackFactory(_ProcessHandler)}, CallbackContext(role="reward")
+    )
+    assert _process_invoke() == os.getpid()
+    with ProcessPoolExecutor(max_workers=1, mp_context=context) as executor:
+        child_pid = executor.submit(_process_invoke).result(timeout=5)
+        assert child_pid != os.getpid()
+    _FORK_REGISTRY.close()
+    evidence = [
+        (kind, int(pid), int(context_pid))
+        for kind, pid, context_pid in (
+            line.split() for line in _FORK_EVIDENCE_PATH.read_text().splitlines()
+        )
+    ]
+    assert set(evidence) == {
+        (kind, pid, pid)
+        for kind in ("created", "closed")
+        for pid in (os.getpid(), child_pid)
+    }
+
+
 def test_best_effort_never_accepts_borrowed_or_required_work():
     registry = CallbackRegistry(
         {"observe": CallbackRegistration(lambda *_: None, policy="best_effort")},

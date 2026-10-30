@@ -4,6 +4,7 @@
 
 from dataclasses import dataclass, replace
 import os
+from multiprocessing.util import Finalize
 from queue import Empty, Full, Queue
 import threading
 import time
@@ -22,10 +23,11 @@ class CallbackContext:
     worker_id: str | None = None
 
     def current_worker(self):
+        thread = threading.current_thread()
         return replace(
             self,
             process_id=os.getpid(),
-            worker_id=f"{threading.current_thread().name}:{threading.get_ident()}",
+            worker_id=f"{thread.name}:{id(thread)}",
         )
 
 
@@ -138,6 +140,10 @@ class CallbackRegistry:
     quiesce required callers before close; optional telemetry never owns payload
     or transport lifetimes. Required callable.close(), when provided, runs on the
     closing owner thread; best-effort close runs on its telemetry worker.
+    A process finalizer is registered on first use, including after fork, to
+    close child-owned instances at worker exit. Finalizer errors are reported by
+    multiprocessing after tasks have completed; strict per-task payload cleanup
+    must run in the synchronous reader callback, never in this finalizer.
     """
 
     def __init__(self, hook_fns, context):
@@ -147,6 +153,7 @@ class CallbackRegistry:
         self._handlers = {}
         self._closed = False
         self._close_error = None
+        self._finalizers = {}
 
     def has(self, name):
         return self.hook_fns.get(name) is not None
@@ -168,10 +175,16 @@ class CallbackRegistry:
         registration = self.validate(name, borrowed=borrowed, required=required)
         if registration is None:
             return None
-        key = (os.getpid(), threading.get_ident(), name)
+        key = (os.getpid(), threading.current_thread(), name)
         with self._lock:
             if self._closed:
                 raise RuntimeError("Application callback registry is closed")
+            if os.getpid() not in self._finalizers:
+                # Constructor/setup can run before fork. Register in the process
+                # that actually binds handlers so child-owned state is retired.
+                self._finalizers[os.getpid()] = Finalize(
+                    None, self.close, exitpriority=10
+                )
             handler = self._handlers.get(key)
             if handler is None:
                 handler = (
@@ -196,6 +209,9 @@ class CallbackRegistry:
                     raise self._close_error
                 return
             self._closed = True
+            finalizer = self._finalizers.pop(os.getpid(), None)
+            if finalizer is not None:
+                finalizer.cancel()
             handlers = [
                 handler
                 for (pid, _, _), handler in self._handlers.items()
