@@ -3,6 +3,7 @@
 """Role-owned application callbacks with explicit borrowed/telemetry boundaries."""
 
 from dataclasses import dataclass, replace
+import inspect
 import os
 from multiprocessing.util import Finalize
 from queue import Empty, Full, Queue
@@ -53,9 +54,20 @@ class CallbackRegistration:
             raise TypeError("A callback must be callable or a CallbackFactory")
 
 
+def _invoke_sync(callback, *args, **kwargs):
+    result = callback(*args, **kwargs)
+    if inspect.isawaitable(result):
+        if inspect.iscoroutine(result):
+            result.close()
+        raise TypeError("Application callbacks must complete synchronously")
+    return result
+
+
 def _create_handler(handler, context):
     callback = (
-        handler.create(context) if isinstance(handler, CallbackFactory) else handler
+        _invoke_sync(handler.create, context)
+        if isinstance(handler, CallbackFactory)
+        else handler
     )
     if not callable(callback):
         raise TypeError("CallbackFactory must return a callable")
@@ -102,7 +114,7 @@ class _BestEffortWorker:
                     continue
                 try:
                     if callback is not None:
-                        callback(*args, **kwargs)
+                        _invoke_sync(callback, *args, **kwargs)
                 except Exception:
                     logger.exception(
                         "Best-effort callback %s failed; event dropped", self.name
@@ -114,7 +126,7 @@ class _BestEffortWorker:
             close = getattr(callback, "close", None)
             if callable(close):
                 try:
-                    close()
+                    _invoke_sync(close)
                 except Exception:
                     logger.exception("Best-effort callback %s close failed", self.name)
 
@@ -198,7 +210,7 @@ class CallbackRegistry:
         if registration.policy == "best_effort":
             handler.submit(args, kwargs)
             return None
-        return handler(*args, **kwargs)
+        return _invoke_sync(handler, *args, **kwargs)
 
     def close(self, timeout_s=1.0):
         if timeout_s < 0:
@@ -230,7 +242,7 @@ class CallbackRegistry:
                 else:
                     close = getattr(handler, "close", None)
                     if callable(close):
-                        close()
+                        _invoke_sync(close)
             except BaseException as error:
                 if first_error is None:
                     first_error = error

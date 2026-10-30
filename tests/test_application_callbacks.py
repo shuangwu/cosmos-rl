@@ -153,6 +153,20 @@ def test_best_effort_never_accepts_borrowed_or_required_work():
     registry.close()
 
 
+@pytest.mark.parametrize("factory", [False, True])
+def test_required_callbacks_and_factories_reject_unfinished_async_readers(factory):
+    async def asynchronous(*args):
+        return None
+
+    registry = CallbackRegistry(
+        {"read": CallbackFactory(asynchronous) if factory else asynchronous},
+        CallbackContext(role="reward"),
+    )
+    with pytest.raises(TypeError, match="complete synchronously"):
+        registry.invoke("read")
+    registry.close()
+
+
 def test_best_effort_factory_and_handler_do_not_block_caller_and_full_queue_drops(
     caplog,
 ):
