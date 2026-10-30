@@ -33,7 +33,10 @@ from cosmos_rl.reward.admission import (
 )
 from cosmos_rl.reward.callbacks import (
     annotate_reward_result,
+    close_reward_callbacks,
     finish_reward_reads,
+    initialize_reward_callbacks,
+    reward_callbacks_for,
     reward_read_scope,
 )
 from cosmos_rl.reward.remote_calculator import RemoteRewardCalculator
@@ -71,21 +74,42 @@ class RewardDispatcher:
         with self._shutdown_lock:
             executor = self.executor
             remote = getattr(self, "is_remote", False)
-            if executor is None and not remote:
+            if (
+                executor is None
+                and not remote
+                and not hasattr(self, "reward_callbacks")
+            ):
                 return
             thread = self._shutdown_thread
             if thread is None:
 
                 def shutdown_executor():
+                    first_error = None
+                    quiesced = False
+                    calculator = getattr(self, "reward_calculator", None)
                     try:
-                        if executor is None:
-                            self.reward_calculator.close()
+                        if remote:
+                            calculator.close()
+                            quiesced = True
+                        elif executor is None:
+                            quiesced = True
                         else:
                             executor.shutdown(wait=True, cancel_futures=True)
-                            if self._canceled_cleanup_error is not None:
-                                raise self._canceled_cleanup_error
+                            quiesced = True
+                        first_error = self._canceled_cleanup_error
                     except BaseException as exc:
-                        self._shutdown_error = exc
+                        first_error = exc
+                        quiesced = remote and getattr(
+                            calculator, "_readers_quiesced", False
+                        )
+                    if quiesced:
+                        for owner in (calculator, self):
+                            try:
+                                close_reward_callbacks(owner)
+                            except BaseException as exc:
+                                if first_error is None:
+                                    first_error = exc
+                    self._shutdown_error = first_error
 
                 thread = threading.Thread(
                     target=shutdown_executor,
@@ -117,6 +141,8 @@ class RewardDispatcher:
         data_packer: Optional[BaseDataPacker] = None,
         val_data_packer: Optional[BaseDataPacker] = None,
         num_workers: int = 2,
+        hook_fns=None,
+        callback_context=None,
     ) -> None:
         """
         Setup the RewardCalculator with the given configuration and data packers.
@@ -130,6 +156,7 @@ class RewardDispatcher:
             num_workers (int): The number of worker processes for parallel reward calculation.
         """
 
+        initialize_reward_callbacks(self, hook_fns, callback_context)
         self.data_packer = data_packer
         self.val_data_packer = val_data_packer
         self.is_remote = config.train.train_policy.use_remote_reward
@@ -158,6 +185,8 @@ class RewardDispatcher:
                 val_reward_fns=val_reward_fns,
                 data_packer=data_packer,
                 val_data_packer=val_data_packer,
+                hook_fns=hook_fns,
+                callback_context=callback_context,
             )
 
         worker_init(
@@ -233,6 +262,7 @@ class RewardDispatcher:
                 ),
                 payloads,
                 is_validation=is_validation,
+                callbacks=reward_callbacks_for(self, is_validation),
             ):
                 results = self._bypass_rewards(payloads, is_validation, step)
             for result in results:
@@ -283,7 +313,10 @@ class RewardDispatcher:
                         )
                     except BaseException:
                         with reward_read_scope(
-                            packer, payloads[i:], is_validation=is_validation
+                            packer,
+                            payloads[i:],
+                            is_validation=is_validation,
+                            callbacks=reward_callbacks_for(self, is_validation),
                         ):
                             raise
 
@@ -297,6 +330,7 @@ class RewardDispatcher:
                                 packer,
                                 original_payloads,
                                 is_validation=is_validation,
+                                callbacks=reward_callbacks_for(self, is_validation),
                                 error=CancelledError(
                                     "Reward task canceled before evaluation"
                                 ),
@@ -351,6 +385,7 @@ class RewardDispatcher:
                     [] if admission.group_excluded else [0.0] * admission.eligible_size,
                     payload.report_metrics,
                     is_validation=is_validation,
+                    callbacks=reward_callbacks_for(self, is_validation),
                 )
                 payloads[payload_idx] = select_payload_completions(payload, admission)
                 if admission.group_excluded:

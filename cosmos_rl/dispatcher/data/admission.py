@@ -52,14 +52,19 @@ class CompletionFailure(BaseModel):
 
 
 @dataclass(frozen=True)
-class CompletionSettlement:
-    """Observed native admission outcome, without a payload or accounting API."""
+class AdmissionCommitted:
+    """Native admission committed; accepted does not mean trained/consumed."""
 
     source_replica: str
     source_rank: int
     identity: CompletionIdentity
     disposition: CompletionDisposition
     diagnostics: CompletionDiagnostics | None = None
+    stage: Literal["admission_committed"] = "admission_committed"
+
+
+# Compatibility for the initial draft API; use AdmissionCommitted in new code.
+CompletionSettlement = AdmissionCommitted
 
 
 @dataclass

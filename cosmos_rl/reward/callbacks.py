@@ -3,12 +3,53 @@
 """Application annotation and final reward-reader boundaries."""
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Mapping
 
 from cosmos_rl.dispatcher.data.diagnostics import CompletionDiagnostics
 from cosmos_rl.utils.logging import logger
+from cosmos_rl.utils.application_callbacks import (
+    CallbackContext,
+    CallbackRegistry,
+    _invoke_sync,
+)
+
+
+def initialize_reward_callbacks(owner, hook_fns=None, context=None):
+    """Bind registrations independently of the application's data packer."""
+    context = context or CallbackContext(role="reward")
+    owner.reward_callbacks = CallbackRegistry(
+        hook_fns, replace(context, is_validation=False)
+    )
+    owner.validation_reward_callbacks = CallbackRegistry(
+        hook_fns, replace(context, is_validation=True)
+    )
+    for registry in (owner.reward_callbacks, owner.validation_reward_callbacks):
+        registry.validate("reward_annotation", borrowed=True)
+        registry.validate("reward_read_complete", borrowed=True, required=True)
+
+
+def reward_callbacks_for(owner, is_validation):
+    return getattr(
+        owner,
+        "validation_reward_callbacks" if is_validation else "reward_callbacks",
+        None,
+    )
+
+
+def close_reward_callbacks(owner):
+    first_error = None
+    for name in ("reward_callbacks", "validation_reward_callbacks"):
+        registry = getattr(owner, name, None)
+        if registry is not None:
+            try:
+                registry.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+    if first_error is not None:
+        raise first_error
 
 
 @dataclass(frozen=True)
@@ -39,8 +80,14 @@ def annotate_reward_result(
     metrics,
     *,
     is_validation,
+    callbacks=None,
 ):
-    callback = getattr(packer, "annotate_reward_result", None)
+    if callbacks is not None and callbacks.has("reward_annotation"):
+
+        def callback(*args):
+            return callbacks.invoke("reward_annotation", *args, borrowed=True)
+    else:
+        callback = getattr(packer, "annotate_reward_result", None)
     if callback is None:
         return
     selected = () if admission.group_excluded else tuple(admission.eligible_indices)
@@ -56,7 +103,7 @@ def annotate_reward_result(
         report_metrics=tuple(MappingProxyType(dict(item or {})) for item in metrics),
         group_excluded=admission.group_excluded,
     )
-    annotations = callback(payload, result)
+    annotations = _invoke_sync(callback, payload, result)
     if annotations is None:
         return
     if type(annotations) is not list or len(annotations) != admission.original_size:
@@ -74,7 +121,7 @@ def annotate_reward_result(
 
 
 @contextmanager
-def reward_read_scope(packer, payloads, *, is_validation):
+def reward_read_scope(packer, payloads, *, is_validation, callbacks=None):
     """Finish every submitted group's application reads, preserving first error.
 
     Cleanup must synchronously finish application readers and release only its
@@ -88,17 +135,38 @@ def reward_read_scope(packer, payloads, *, is_validation):
         error = exc
         raise
     finally:
-        finish_reward_reads(packer, payloads, is_validation=is_validation, error=error)
+        finish_reward_reads(
+            packer,
+            payloads,
+            is_validation=is_validation,
+            error=error,
+            callbacks=callbacks,
+        )
 
 
-def finish_reward_reads(packer, payloads, *, is_validation, error):
+def finish_reward_reads(packer, payloads, *, is_validation, error, callbacks=None):
     """Notify terminal/canceled reads without replacing a primary error."""
-    callback = getattr(packer, "on_reward_read_complete", None)
+    readers = []
+    if callbacks is not None and callbacks.has("reward_read_complete"):
+
+        def callback(*args, **kwargs):
+            return callbacks.invoke(
+                "reward_read_complete", *args, borrowed=True, required=True, **kwargs
+            )
+
+        readers.append(callback)
+    packer_cleanup = getattr(packer, "on_reward_read_complete", None)
+    if packer_cleanup is not None:
+        readers.append(packer_cleanup)
     cleanup_error = None
-    if callback is not None:
-        for payload in payloads:
+    for payload in payloads:
+        # Registered application readers finish before packer-owned reward
+        # views retire. Each callback releases only its own reader references.
+        for callback in readers:
             try:
-                callback(payload, is_validation=is_validation, error=error)
+                _invoke_sync(
+                    callback, payload, is_validation=is_validation, error=error
+                )
             except BaseException as exc:
                 if cleanup_error is None:
                     cleanup_error = exc

@@ -27,6 +27,12 @@ from cosmos_rl.reward.dispatcher import RewardDispatcher
 from cosmos_rl.reward.identity import CompletionReporter
 from cosmos_rl.reward.local_calculator import LocalRewardCalculator
 from cosmos_rl.reward.remote_calculator import RemoteRewardCalculator
+from cosmos_rl.reward.callbacks import initialize_reward_callbacks
+from cosmos_rl.utils.application_callbacks import (
+    CallbackContext,
+    CallbackFactory,
+    CallbackRegistration,
+)
 
 
 class Algo(GRPO):
@@ -309,6 +315,397 @@ def test_multibyte_group_diagnostic_limit_counts_encoded_bytes():
             [{}] * 100,
             is_validation=False,
         )
+
+
+@pytest.mark.parametrize("validation", [False, True])
+def test_registered_reward_callbacks_need_no_custom_packer(validation):
+    contexts, completed = [], []
+
+    def create_annotation(context):
+        contexts.append(context)
+        return lambda payload, result: [
+            {"slot": slot} for slot in range(len(result.rewards))
+        ]
+
+    calculator = local(None)
+    initialize_reward_callbacks(
+        calculator,
+        {
+            "reward_annotation": CallbackFactory(create_annotation),
+            "reward_read_complete": lambda source, **kwargs: completed.append(
+                (source, kwargs)
+            ),
+        },
+        CallbackContext(role="reward", replica_name="source", global_rank=4),
+    )
+    source = payload([True, False, True])
+    result, _, _ = calculator.compute_rewards([source], validation, 7)
+    assert [item.original_index for item in result[0].completion_diagnostics] == (
+        [0, 1, 2] if validation else [0, 2]
+    )
+    assert completed == [(source, {"is_validation": validation, "error": None})]
+    assert contexts[0].is_validation is validation
+    assert contexts[0].replica_name == "source" and contexts[0].global_rank == 4
+
+
+def test_cleanup_registration_is_strict_and_preserves_primary_annotation_failure():
+    calculator = local(None)
+    with pytest.raises(ValueError, match="must be required"):
+        initialize_reward_callbacks(
+            calculator,
+            {
+                "reward_read_complete": CallbackRegistration(
+                    lambda *_: None, policy="best_effort"
+                )
+            },
+        )
+    primary = RuntimeError("annotation failed")
+    cleanup = Mock(side_effect=ValueError("cleanup failed"))
+    initialize_reward_callbacks(
+        calculator,
+        {
+            "reward_annotation": Mock(side_effect=primary),
+            "reward_read_complete": cleanup,
+        },
+    )
+    with pytest.raises(RuntimeError) as raised:
+        calculator.compute_rewards([payload()], False, 7)
+    assert raised.value is primary
+    assert cleanup.call_args.kwargs["error"] is primary
+
+
+@pytest.mark.parametrize(
+    "boundary", ["annotate_reward_result", "on_reward_read_complete"]
+)
+def test_packer_hooks_reject_async_readers_in_the_same_strict_boundary(boundary):
+    async def asynchronous(*args, **kwargs):
+        return None
+
+    packer = Packer()
+    setattr(packer, boundary, asynchronous)
+    with pytest.raises(TypeError, match="complete synchronously"):
+        local(packer).compute_rewards([payload()], False, 7)
+
+
+@pytest.mark.parametrize("path", ["remote", "bypass"])
+def test_registered_reward_callbacks_reach_remote_and_bypass_paths(path):
+    source = payload([True, False, True])
+    annotation, cleanup = Mock(return_value=[{}, {}, {}]), Mock()
+    if path == "remote":
+        owner, pending = remote(None, source)
+    else:
+        owner = RewardDispatcher()
+        owner.is_remote = False
+        owner.minimum_trainable_completions = 2
+    initialize_reward_callbacks(
+        owner, {"reward_annotation": annotation, "reward_read_complete": cleanup}
+    )
+    if path == "remote":
+        result, _, _ = owner.get_results(pending)
+    else:
+        owner.enqueue_rewards_cal([source], False, 7, bypass_reward=True)
+        result, _, _, _ = owner.dequeue_rewards_cal()
+    annotation.assert_called_once()
+    cleanup.assert_called_once_with(source, is_validation=False, error=None)
+    assert [item.original_index for item in result[0].completion_diagnostics] == [0, 2]
+
+
+def test_trtllm_setup_forwards_registered_callbacks_without_importing_backend():
+    import ast
+    from pathlib import Path
+
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "cosmos_rl/rollout/trtllm_rollout/trtllm_rollout_wrapper.py"
+    )
+    module = ast.parse(source.read_text())
+    wrapper = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == "TRTLLMRolloutWrapper"
+    )
+    setup = next(
+        node
+        for node in wrapper.body
+        if isinstance(node, ast.FunctionDef) and node.name == "setup"
+    )
+    code = ast.Module(
+        body=[
+            ast.ImportFrom(
+                module="__future__", names=[ast.alias(name="annotations")], level=0
+            ),
+            setup,
+        ],
+        type_ignores=[],
+    )
+    ast.fix_missing_locations(code)
+    namespace = {
+        "WorkerDataFetcher": Mock(),
+        "CallbackContext": CallbackContext,
+        "COSMOS_REWARD_DISPATCHER_CONCURRENCY": 2,
+    }
+    exec(compile(code, str(source), "exec"), namespace)
+    worker = SimpleNamespace(
+        init_data_packer=Mock(),
+        data_packer=None,
+        val_data_packer=None,
+        config=SimpleNamespace(),
+        reward_dispatcher=Mock(),
+        replica_name="trt-source",
+        global_rank=5,
+    )
+    hooks = {"reward_read_complete": Mock()}
+    namespace["setup"](worker, hook_fns=hooks)
+    forwarded = worker.reward_dispatcher.setup.call_args.kwargs
+    assert forwarded["hook_fns"] is hooks
+    assert forwarded["callback_context"] == CallbackContext(
+        role="reward", replica_name="trt-source", global_rank=5
+    )
+    initialization = next(
+        node
+        for node in wrapper.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_initialize"
+    )
+    calls = [
+        node
+        for node in ast.walk(initialization)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "setup"
+    ]
+    assert any(keyword.arg == "hook_fns" for call in calls for keyword in call.keywords)
+
+
+def test_registered_annotation_takes_precedence_and_cleanup_composes_with_packer():
+    packer = Packer()
+    packer.annotate_reward_result = Mock(
+        side_effect=AssertionError("deprecated annotation")
+    )
+    packer.on_reward_read_complete = Mock()
+    calculator = local(packer)
+    annotation, cleanup = Mock(return_value=[{}, {}, {}]), Mock()
+    initialize_reward_callbacks(
+        calculator, {"reward_annotation": annotation, "reward_read_complete": cleanup}
+    )
+    calculator.compute_rewards([payload()], False, 7)
+    annotation.assert_called_once()
+    cleanup.assert_called_once()
+    packer.annotate_reward_result.assert_not_called()
+    packer.on_reward_read_complete.assert_called_once()
+
+
+def test_best_effort_admission_committed_is_bounded_detached_and_replay_suppressed(
+    caplog,
+):
+    import threading
+    import time
+
+    entered, release = threading.Event(), threading.Event()
+    events = []
+
+    def observe(batch):
+        entered.set()
+        assert release.wait(2)
+        events.extend(batch)
+        raise ValueError("optional telemetry failed")
+
+    state = CompletionAdmissionState(
+        hook_fns={
+            "admission_committed": CallbackRegistration(
+                observe, policy="best_effort", queue_capacity=1
+            )
+        }
+    )
+    status = PolicyStatusManager()
+    status.current_step = 7
+    status.samples_on_the_fly = 3
+    status.rollout_admission_closed = lambda: False
+    status._publish_payload_transport_cleanup = Mock()
+    controller = SimpleNamespace(
+        policy_status_manager=status,
+        rollout_status_manager={
+            "source": SimpleNamespace(
+                n_atoms_per_replica=lambda: 1, status=SimpleNamespace(ended=False)
+            )
+        },
+    )
+
+    def submit(index):
+        request = RolloutRequest(
+            src_replica_name="source",
+            src_global_rank=0,
+            payloads=[],
+            completion_identities=[],
+            completion_failures=[
+                CompletionFailure(
+                    identity=CompletionIdentity(sequence=index, weight_version=7),
+                    reason="quality",
+                    diagnostics=CompletionDiagnostics(
+                        original_index=index, metadata={"value": [index]}
+                    ),
+                )
+            ],
+        )
+        started = time.monotonic()
+        state.settle(controller, request, state.prepare(controller, request, []))
+        assert time.monotonic() - started < 0.5
+        return request
+
+    try:
+        first = submit(0)
+        assert entered.wait(1)
+        first.completion_failures[0].diagnostics.metadata["value"].append("mutated")
+        state.settle(controller, first, state.prepare(controller, first, []))
+        submit(1)
+        submit(2)  # Queue is bounded; the third telemetry event is dropped.
+        assert not state.failed and status.samples_on_the_fly == 0
+        assert "queue full" in caplog.text
+    finally:
+        release.set()
+        state.close()
+    assert [event.identity.sequence for event in events] == [0, 1]
+    assert events[0].diagnostics.metadata == {"value": [0]}
+    assert all(event.stage == "admission_committed" for event in events)
+    assert "event dropped" in caplog.text
+    assert not state.failed and status.filter_records["application_rejected"] == 3
+
+
+@pytest.mark.parametrize("failure", ["registered", "packer", "both", "primary"])
+def test_registered_and_packer_cleanup_finish_both_owners_and_keep_first_error(failure):
+    packer = Packer()
+    order = []
+    registered_error = RuntimeError("registered cleanup")
+    packer_error = ValueError("packer cleanup")
+    primary_error = RuntimeError("original annotation")
+
+    def registered_cleanup(*args, **kwargs):
+        order.append("registered")
+        if failure in ("registered", "both", "primary"):
+            raise registered_error
+
+    def packer_cleanup(*args, **kwargs):
+        order.append("packer")
+        if failure in ("packer", "both", "primary"):
+            raise packer_error
+
+    packer.on_reward_read_complete = packer_cleanup
+    calculator = local(packer)
+    initialize_reward_callbacks(
+        calculator,
+        {
+            "reward_read_complete": registered_cleanup,
+            "reward_annotation": Mock(side_effect=primary_error)
+            if failure == "primary"
+            else Mock(return_value=None),
+        },
+    )
+    with pytest.raises((RuntimeError, ValueError)) as raised:
+        calculator.compute_rewards([payload()], False, 7)
+    assert raised.value is (
+        primary_error
+        if failure == "primary"
+        else packer_error
+        if failure == "packer"
+        else registered_error
+    )
+    assert order == ["registered", "packer"]
+
+
+@pytest.mark.parametrize("remote_reward", [False, True])
+@pytest.mark.parametrize("quiesced", [False, True])
+def test_shutdown_preserves_first_error_and_closes_both_registries_only_after_quiescence(
+    remote_reward, quiesced
+):
+    original = RuntimeError("native shutdown failed")
+    calculator_registry, submitter_registry = Mock(), Mock()
+    calculator_registry.close.side_effect = ValueError("factory close failed")
+    calculator = SimpleNamespace(
+        reward_callbacks=calculator_registry,
+        _readers_quiesced=quiesced,
+        close=Mock(side_effect=original),
+    )
+    dispatcher = RewardDispatcher()
+    dispatcher.is_remote = remote_reward
+    dispatcher.reward_calculator = calculator
+    dispatcher.reward_callbacks = submitter_registry
+    if not remote_reward:
+        dispatcher.executor = Mock()
+        if quiesced:
+            dispatcher._canceled_cleanup_error = original
+        else:
+            dispatcher.executor.shutdown.side_effect = original
+    with pytest.raises(RuntimeError, match="shutdown failed") as raised:
+        dispatcher.shutdown(timeout_s=2)
+    assert raised.value.__cause__ is original
+    assert calculator_registry.close.call_count == int(quiesced)
+    assert submitter_registry.close.call_count == int(quiesced)
+
+
+@pytest.mark.parametrize(
+    "primary,publisher_failure", [(True, True), (False, True), (False, False)]
+)
+def test_controller_shutdown_closes_observers_after_publisher_failure_and_preserves_first_error(
+    monkeypatch, primary, publisher_failure
+):
+    import asyncio
+    import threading
+    from unittest.mock import AsyncMock
+    from cosmos_rl.dispatcher import run_web_panel
+    from cosmos_rl.dispatcher.publication import ControllerPublisher
+
+    original, publication, callback = (
+        RuntimeError("request failed"),
+        ValueError("publisher close"),
+        RuntimeError("callback close"),
+    )
+    publisher = ControllerPublisher(SimpleNamespace(), on_failure=lambda error: None)
+    publisher.close = AsyncMock(side_effect=publication if publisher_failure else None)
+    closed_on = []
+
+    def close_observers():
+        closed_on.append(threading.get_ident())
+        raise callback
+
+    observer = SimpleNamespace(close=Mock(side_effect=close_observers))
+
+    class Policies:
+        terminal_error = None
+        redis_handler = SimpleNamespace(_publication_failure=None)
+        maintain_life_status = Mock()
+        training_finished = staticmethod(lambda: False)
+
+        def __len__(self):
+            return 1
+
+    controller = SimpleNamespace(
+        redis_controller=publisher,
+        completion_admission=observer,
+        policy_status_manager=Policies(),
+        life_cycle_lock=asyncio.Lock(),
+        rollout_status_manager=Mock(),
+        config=SimpleNamespace(validation=SimpleNamespace(enable=False)),
+    )
+    monkeypatch.setattr(run_web_panel, "controller", controller)
+    monkeypatch.setattr(run_web_panel, "_maybe_finalize", lambda reason: False)
+    monkeypatch.setattr(run_web_panel, "should_broadcast_stop", lambda **kwargs: False)
+    monkeypatch.setattr(run_web_panel, "COSMOS_SHUTDOWN_ON_NO_POLICY_REPLICAS", False)
+    monkeypatch.setattr(run_web_panel, "_observe_controller_monitor", lambda task: None)
+
+    async def scenario():
+        async with run_web_panel.lifespan(run_web_panel.app):
+            await asyncio.sleep(0)
+            if primary:
+                raise original
+
+    with pytest.raises((RuntimeError, ValueError)) as raised:
+        asyncio.run(scenario())
+    assert raised.value is (
+        original if primary else publication if publisher_failure else callback
+    )
+    publisher.close.assert_awaited_once()
+    observer.close.assert_called_once()
+    publisher._writer.shutdown(wait=True)
+    assert closed_on[0] != threading.get_ident()
 
 
 def test_native_settlement_observer_is_replay_suppressed_after_accounting():

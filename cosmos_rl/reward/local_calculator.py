@@ -21,7 +21,12 @@ from cosmos_rl.dispatcher.algo.reward import Reward
 from cosmos_rl.dispatcher.data.packer import BaseDataPacker
 from cosmos_rl.policy.config import Config
 from cosmos_rl.reward.base import RolloutGroup
-from cosmos_rl.reward.callbacks import annotate_reward_result, reward_read_scope
+from cosmos_rl.reward.callbacks import (
+    annotate_reward_result,
+    initialize_reward_callbacks,
+    reward_callbacks_for,
+    reward_read_scope,
+)
 from cosmos_rl.reward.admission import (
     aggregate_excluded_reward_metrics,
     select_payload_completions,
@@ -93,6 +98,8 @@ class LocalRewardCalculator:
         val_reward_fns: Optional[List[Callable]] = None,
         data_packer: Optional[BaseDataPacker] = None,
         val_data_packer: Optional[BaseDataPacker] = None,
+        hook_fns=None,
+        callback_context=None,
     ) -> None:
         """
         Setup the LocalRewardCalculator with the given configuration and data packers.
@@ -110,6 +117,7 @@ class LocalRewardCalculator:
             )
             return
         self.config = config
+        initialize_reward_callbacks(self, hook_fns, callback_context)
         self.data_packer = data_packer
         self.val_data_packer = val_data_packer
         self.tokenizer = util.setup_tokenizer(self.config.policy.model_name_or_path)
@@ -166,7 +174,10 @@ class LocalRewardCalculator:
         self, payloads: List[RLPayload], step: int
     ) -> Tuple[List[RLPayload], bool, int]:
         with reward_read_scope(
-            getattr(self, "val_data_packer", None), payloads, is_validation=True
+            getattr(self, "val_data_packer", None),
+            payloads,
+            is_validation=True,
+            callbacks=reward_callbacks_for(self, True),
         ):
             return self._compute_validation_rewards(payloads, step)
 
@@ -184,6 +195,7 @@ class LocalRewardCalculator:
             [rollout.advantage for rollout in rollouts],
             group.all_reward_metrics,
             is_validation=is_validation,
+            callbacks=reward_callbacks_for(self, is_validation),
         )
         return rollouts
 
@@ -267,7 +279,10 @@ class LocalRewardCalculator:
         if is_validation:
             return self.compute_validation_rewards(payloads, step)
         with reward_read_scope(
-            getattr(self, "data_packer", None), payloads, is_validation=False
+            getattr(self, "data_packer", None),
+            payloads,
+            is_validation=False,
+            callbacks=reward_callbacks_for(self, False),
         ):
             return self._compute_training_rewards(payloads, step)
 

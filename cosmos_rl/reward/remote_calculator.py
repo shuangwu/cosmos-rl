@@ -37,6 +37,8 @@ from cosmos_rl.reward.admission import (
 )
 from cosmos_rl.reward.callbacks import (
     annotate_reward_result,
+    initialize_reward_callbacks,
+    reward_callbacks_for,
     finish_reward_reads,
     reward_read_scope,
 )
@@ -63,12 +65,14 @@ class RemoteRewardCalculator:
         self._reader_lock = threading.RLock()
         self._closed = False
         self._close_error = None
+        self._readers_quiesced = False
 
     def close(self, error=None):
         """Cancel pending application reads after active reward readers finish."""
         with self._reader_lock:
             original_error = error
             self._closed = True
+            self._readers_quiesced = True
             pending = list(getattr(self, "uuid2payload", {}).items())
             stages = dict(getattr(self, "uuid2stage", {}))
             for name in (
@@ -89,6 +93,7 @@ class RemoteRewardCalculator:
                     ),
                     payloads,
                     is_validation=validation,
+                    callbacks=reward_callbacks_for(self, validation),
                     error=error,
                 )
                 if self._close_error is None:
@@ -104,6 +109,8 @@ class RemoteRewardCalculator:
         val_reward_fns: Optional[List[Callable]] = None,
         data_packer: Optional[BaseDataPacker] = None,
         val_data_packer: Optional[BaseDataPacker] = None,
+        hook_fns=None,
+        callback_context=None,
     ) -> None:
         """
         Setup the RemoteRewardCalculator with the given configuration and data packers.
@@ -121,6 +128,7 @@ class RemoteRewardCalculator:
             )
             return
         self.train_config = config.train.train_policy.remote_reward
+        initialize_reward_callbacks(self, hook_fns, callback_context)
         self.data_packer = data_packer
         self.val_data_packer = val_data_packer
         self.val_config = config.validation.remote_reward
@@ -255,6 +263,7 @@ class RemoteRewardCalculator:
                 ),
                 payloads,
                 is_validation=is_validation,
+                callbacks=reward_callbacks_for(self, is_validation),
             ):
                 raise
 
@@ -478,6 +487,7 @@ class RemoteRewardCalculator:
                 ),
                 payloads,
                 is_validation=is_validation,
+                callbacks=reward_callbacks_for(self, is_validation),
             ):
                 counts = self.uuid2completions_per_payload[uuid]
                 if (
@@ -568,6 +578,7 @@ class RemoteRewardCalculator:
                 advantages,
                 [{"reward": value} for value in all_rewards],
                 is_validation=is_validation,
+                callbacks=reward_callbacks_for(self, is_validation),
             )
             if admission.explicit or payload.completion_sequences is not None:
                 selected_payload = select_payload_completions(payload, admission)

@@ -29,6 +29,7 @@ from cosmos_rl.utils.constant import (
 
 
 from cosmos_rl.utils.logging import logger
+from cosmos_rl.utils.application_callbacks import CallbackContext
 
 # Note: this must be before import tensorrt_llm and calls of MPI.init
 # Otherwise, environment will not be inherited by MPI.
@@ -173,6 +174,7 @@ class TRTLLMRolloutWrapper(TRTLLMRolloutWorkerBase):
             val_dataset=kwargs.get("val_dataset"),
             val_data_packer=kwargs.get("val_data_packer"),
             val_reward_fns=kwargs.get("val_reward_fns"),
+            hook_fns=kwargs.get("hook_fns"),
         )
         atexit.register(self.handle_shutdown)
 
@@ -185,6 +187,7 @@ class TRTLLMRolloutWrapper(TRTLLMRolloutWorkerBase):
         val_dataset: Optional[Dataset] = None,
         val_data_packer: Optional[Union[BaseDataPacker, Callable]] = None,
         val_reward_fns: Optional[List[Callable]] = None,
+        hook_fns=None,
     ):
         # setup data packer first
         self.init_data_packer(
@@ -210,6 +213,12 @@ class TRTLLMRolloutWrapper(TRTLLMRolloutWorkerBase):
             data_packer=self.data_packer,
             val_data_packer=self.val_data_packer,
             num_workers=COSMOS_REWARD_DISPATCHER_CONCURRENCY,
+            hook_fns=hook_fns,
+            callback_context=CallbackContext(
+                role="reward",
+                replica_name=self.replica_name,
+                global_rank=self.global_rank,
+            ),
         )
 
     def report_rollouts(self, block=False):

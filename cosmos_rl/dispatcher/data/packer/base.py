@@ -111,7 +111,7 @@ class BaseDataPacker(ABC):
         return items
 
     def annotate_reward_result(self, payload, result):
-        """Optionally return detached diagnostics in original completion order.
+        """Compatibility fallback for registered reward_annotation callbacks.
 
         Called after native reward, advantage and admission computation. Treat
         payload/result as borrowed read-only views; return a list of small JSON
@@ -121,7 +121,7 @@ class BaseDataPacker(ABC):
         return None
 
     def on_reward_read_complete(self, payload, *, is_validation: bool, error):
-        """Finish application reward readers on success and failure.
+        """Finish packer-owned reward readers after registered application readers.
 
         Release only reward-owned views, retaining anything policy or transport
         readers still need. Synchronize asynchronous application readers here.
