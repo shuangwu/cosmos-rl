@@ -162,7 +162,9 @@ class Controller:
         from uuid import uuid4
 
         config.controller_execution_id = (
-            uuid4().hex if resume_adapter is not None else None
+            uuid4().hex
+            if resume_adapter is not None or config.rollout.rollout_only
+            else None
         )
         task_type = config.train.train_policy.type
         if type(completion_admission) is not bool:

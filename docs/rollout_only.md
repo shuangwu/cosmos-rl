@@ -52,21 +52,110 @@ undispatched remainder and cannot overrun either admission limit.
 
 Execution ends when the dataset completes `train.epoch` passes, or the optional
 positive `rollout.max_prompts` limit is reached. The limit counts dispatched
-prompts, including prompts whose generation or quality selection fails; it does
-not request replacements. An empty dataset ends without any generation call.
+prompts, including prompts whose generation fails; it does not request
+replacements based on quality annotations. An empty dataset ends without any generation call.
 `train.max_num_steps` does not define a rollout-only horizon.
 
-Reward and result packing run normally on the worker. Reports are receipt-checked
-and counted, then transport payloads are released after reward processing.
-Results never enter policy training buffers and do not update an optimizer or
-consume a training sample budget. The controller logs completion counts and
-outstanding completion slots; the application owns any desired persistence of
-scores, completions or simulator outputs through its backend/reward integration.
-This mode does not introduce a result sink or evaluation metric definition.
+## Generation and optional scoring
+
+Rollout-only generation does not prepare a training objective: it never computes
+advantages, applies GRPO group minima, normalizes scores or selects shared-prefix
+training tokens. Every generated completion is retained, including an empty
+string and completions marked low quality. Producer `completion_trainable` masks
+and `completion_drop_reasons` remain annotations for the application result
+consumer; they do not remove rollout-only outputs. Missing reserved completions
+are separate generation-failure outcomes.
+
+Set `[train.train_policy].bypass_reward = true` for pure generation. This skips
+local reward construction, scorer tokenizer initialization, remote scoring setup
+and reward executors. Public result scores are **None**, even though the existing
+transport uses zero reward/advantage placeholders. No reward function needs to
+be configured in this mode; `reward_function = {}` is accepted with
+`bypass_reward = true`.
+
+With `bypass_reward = false`, the ordinary configured reward functions or
+`launch_worker(reward_fns=[...])` score every generated output, independently of
+its quality annotation. Scorers receive the existing `(completion, reference,
+**kwargs)` contract; `reference` may be **None**, so reference-free functions do
+not need a fabricated label. Group scoring remains available as a scoring API,
+without a training group minimum. Existing remote multimodal scoring is also
+supported. Scorer errors, malformed scores and exhausted remote request retries
+are strict failures that terminate the job; they never become zero scores or
+silently discarded completions.
+
+## Application result consumer
+
+Pass `hook_fns={"rollout_result": consumer}` through the existing launcher entry
+API to consume outputs. A plain callable is synchronous and required. A
+`CallbackFactory` can create a consumer once in the owning process/thread using
+`CallbackContext(role="rollout", replica_name=..., global_rank=...)`. A
+`CallbackRegistration` must use `policy="required"` at this boundary; best-effort
+queues are rejected because results and payload references are borrowed.
+
+The consumer receives one frozen `RolloutResultEvent` per reserved prompt:
+
+- `execution_id`, native `work_id`, and per-outcome `slot` provide stable attempt
+  and completion identities. The controller starts a fresh execution UUID for
+  every rollout-only run; dataset indices can repeat between epochs.
+- `model_name_or_path`, `model_revision` and `weight_version=0` identify the
+  configured checkpoint/model. A path/revision is an identity string, not a
+  claim that local files have been content-hashed.
+- `prompt`, `conversation`, `extra_info`, and each outcome's completion,
+  conversation, token IDs, log probabilities and scorer metrics expose the
+  original data or application references.
+- Each `CompletionOutcome` has `status="generated"` or `"generation_failed"`,
+  an optional score, producer quality flag/reason, and a failure reason when
+  generation did not produce the reserved slot. Quality flags are separate from
+  generation status. An unscored generated output has `score=None`.
+
+The reporting rank invokes the consumer after optional scoring and before
+`data_packer.get_rollout_output()`, HTTP reporting and transport cleanup. Its
+borrowed lifetime ends when the call returns. The envelope is frozen, but nested
+objects/tensor storage remain borrowed and must be treated as read-only. Copy or
+persist the data synchronously before returning; never retain it in an
+application queue. Outputs retain their worker/packer ownership through the
+consumer call. Reward-reader cleanup hooks, when composed with application
+callbacks, release only temporary reward-reader ownership and must not release
+outputs still owned by the rollout worker. Rollout-only does not invoke the
+training/admission `reward_annotation` hook. When composed with application
+callbacks, both registered and packer `reward_read_complete` hooks still run
+once at the reward-reader boundary, including scoring failures and unscored
+bypass, before result publication. Scorer metrics and original quality masks
+are exposed through `rollout_result` instead of training diagnostics.
+
+Consumer exceptions fail the run before packing or settlement. Generation
+exceptions attempt a failure event for each affected prompt, preserving the
+original generation error if a consumer also fails. Async generation reports its
+normal terminal empty-result failures through the same consumer boundary.
+Native HTTP retries reuse their report receipt after consumption and do not
+repeat the consumer. There is no persistence guarantee across process death or
+an application consumer failure; applications that resume their own writes
+should deduplicate by `(execution_id, work_id, slot)`. Applications own result
+persistence and scoring semantics.
+
+The runnable JSONL entry script copies tensors/arrays with values, shape and
+dtype, retains structured artifact references, and rejects opaque objects rather
+than writing a lossy representation:
+
+```bash
+COSMOS_ROLLOUT_RESULTS_DIR=./results cosmos-rl --config configs/rollout-only.toml examples/rollout_only_jsonl.py
+```
+
+Each reporting rank owns a separate JSONL file. Its factory opens the file in the
+executing rollout process, and its `close()` flushes/releases application state
+during worker teardown. For large media, adapt the sink to write artifacts and
+persist durable references instead of inline arrays.
+
+Reports remain receipt-checked and counted, then transport payloads are released
+after consumption. Results never enter policy training buffers or consume a
+training sample budget. The controller logs counts and outstanding completion
+slots; the application consumer supplies the durable outputs.
+
+## Stop and cleanup
 
 After all initial rollout replicas have registered, a controller-side
-`await controller.request_stop("reason")` closes new prompt admission, preserves the first stop reason, and lets admitted generation/reward
-work drain. It does not request a training checkpoint. After every reporter of
+`await controller.request_stop("reason")` closes new prompt admission, preserves
+the first stop reason, and lets admitted generation/scoring work drain. It does not request a training checkpoint. After every reporter of
 every registered initial rollout replica has acknowledged its final report and
 posted its end signal, the controller broadcasts the normal NCCL-free STOP.
 Workers remain command participants until that broadcast, preserving multi-rank

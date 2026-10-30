@@ -679,8 +679,8 @@ class GrpoConfig(BaseModel):
             self.reward_function = {self.reward_function: 1.0}
         elif isinstance(self.reward_function, list):
             self.reward_function = {k: 1.0 for k in self.reward_function}
-        assert len(self.reward_function) > 0, (
-            "reward_function must be a dict of reward functions"
+        assert self.bypass_reward or len(self.reward_function) > 0, (
+            "reward_function must be a nonempty dict unless bypass_reward=True"
         )
         if isinstance(self.filter_reward_metric, str):
             self.filter_reward_metric = [self.filter_reward_metric]
