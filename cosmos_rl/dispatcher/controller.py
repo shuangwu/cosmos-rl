@@ -847,6 +847,36 @@ maxmemory-policy noeviction
             # Don't do the weight version control at fetching when there is replica scaling since the pending rollout count may not reflect the real training status of the policy replicas during scaling, which may lead to too aggressive throttling and cause starvation of rollout generation.
             and len(self.policy_status_manager.replica_scaling_log) == 0
         ):
+            if (
+                not rank_dispatch
+                and self.config.train.train_policy.variant != "dapo"
+                and self.config.train.train_policy.allowed_outdated_steps == 0
+            ):
+                # A strict worker waits for the queued batch's highest
+                # required version. Bound the fetch before consuming dataset
+                # rows or reserving samples so that assignment cannot spill
+                # into the next version after spending a refill credit.
+                self._prune_refill_state(
+                    before_weight_version=weight_version_for_current_batch
+                )
+                credits = getattr(self, "weight_version_to_replacement_prompt_num", {})
+                replacements = getattr(
+                    self, "weight_version_to_replacement_prompt_issued", {}
+                )
+                ordinary_issued = self.weight_version_to_prompt_num.get(
+                    weight_version_for_current_batch, 0
+                ) - replacements.get(weight_version_for_current_batch, 0)
+                remaining = max(0, global_batch_size - ordinary_issued) + credits.get(
+                    weight_version_for_current_batch, 0
+                )
+                n = min(n, remaining)
+                if n <= 0:
+                    # Quota exhaustion is temporary, but preserve the normal
+                    # prompt-stream completion signal after the last update.
+                    return [], (
+                        not self.config.validation.enable
+                        and self.policy_status_manager.training_finished()
+                    )
             payloads_list, is_end = self.data_fetcher.get_batched_prompt(
                 n,
                 validation_step,

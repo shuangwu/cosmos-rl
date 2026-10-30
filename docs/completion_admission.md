@@ -124,6 +124,15 @@ Replacement prompts do not consume still-unissued normal prompt quota. This is
 essential when a producer reports a failure before other producers finish
 fetching their initial batch, especially with zero allowed staleness.
 
+In disaggregated non-DAPO shared-queue dispatch with
+`allowed_outdated_steps=0`, each fetch is bounded before reading dataset rows
+or charging samples to the remaining ordinary quota plus replacement credits
+for its assigned weight version. A request for four prompts with one replacement
+credit and no ordinary capacity returns that one replacement, leaving the next
+version's quota untouched. An empty quota returns a temporary empty response,
+not end-of-input. Positive-staleness, validation, colocated and scaling paths
+retain their existing behavior; rank-affine dispatch uses its destination quotas.
+
 Admission and replica changes share the controller lifecycle lock. Closed
 admission discards without reopening prompt capacity. An infrastructure error
 after settlement starts terminates the controller process with exit code 86.
