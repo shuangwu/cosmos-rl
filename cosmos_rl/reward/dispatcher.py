@@ -157,6 +157,7 @@ class RewardDispatcher:
         """
 
         initialize_reward_callbacks(self, hook_fns, callback_context)
+        self.callback_context = callback_context
         self.data_packer = data_packer
         self.val_data_packer = val_data_packer
         self.is_remote = config.train.train_policy.use_remote_reward
@@ -186,7 +187,7 @@ class RewardDispatcher:
                 data_packer=data_packer,
                 val_data_packer=val_data_packer,
                 hook_fns=hook_fns,
-                callback_context=callback_context,
+                callback_context=self.callback_context,
             )
 
         worker_init(

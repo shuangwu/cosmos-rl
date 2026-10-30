@@ -17,6 +17,7 @@ import torch
 import atexit
 import threading
 import time
+from dataclasses import replace
 from queue import Queue, Empty
 from typing import List, Tuple, Optional, Any, Callable, Union
 from torch.utils.data import Dataset
@@ -216,7 +217,7 @@ class TRTLLMRolloutWrapper(TRTLLMRolloutWorkerBase):
             hook_fns=hook_fns,
             callback_context=CallbackContext(
                 role="reward",
-                replica_name=self.replica_name,
+                replica_name=getattr(self, "replica_name", None),
                 global_rank=self.global_rank,
             ),
         )
@@ -325,6 +326,25 @@ class TRTLLMRolloutWrapper(TRTLLMRolloutWorkerBase):
     def bind_report_source(self, source):
         self.api_client.adopt_rollout_reporting(source)
         self.replica_name = source["replica_name"]
+        # TRT receives its registered source after setup, before reward workers
+        # start. Bind factories to this source instead of the pre-IPC placeholder.
+        dispatcher = getattr(self, "reward_dispatcher", None)
+        if dispatcher is not None:
+            context = CallbackContext(
+                role="reward",
+                replica_name=self.replica_name,
+                global_rank=source.get(
+                    "global_rank", getattr(self, "global_rank", None)
+                ),
+            )
+            dispatcher.callback_context = context
+            for owner in (dispatcher, dispatcher.reward_calculator):
+                for name in ("reward_callbacks", "validation_reward_callbacks"):
+                    registry = getattr(owner, name, None)
+                    if registry is not None:
+                        registry.context = replace(
+                            context, is_validation=name.startswith("validation")
+                        )
         self._is_registered = True
 
     @torch.no_grad()

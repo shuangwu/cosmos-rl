@@ -474,6 +474,36 @@ def test_trtllm_setup_forwards_registered_callbacks_without_importing_backend():
         and node.func.attr == "setup"
     ]
     assert any(keyword.arg == "hook_fns" for call in calls for keyword in call.keywords)
+    del worker.replica_name
+    namespace["setup"](worker, hook_fns=hooks)
+    assert (
+        worker.reward_dispatcher.setup.call_args.kwargs["callback_context"].replica_name
+        is None
+    )
+
+    from dataclasses import replace
+
+    bind = next(
+        node
+        for node in wrapper.body
+        if isinstance(node, ast.FunctionDef) and node.name == "bind_report_source"
+    )
+    binding_code = ast.Module(body=[bind], type_ignores=[])
+    ast.fix_missing_locations(binding_code)
+    namespace["replace"] = replace
+    exec(compile(binding_code, str(source), "exec"), namespace)
+    calculator = SimpleNamespace()
+    worker.reward_dispatcher = SimpleNamespace(reward_calculator=calculator)
+    worker.api_client = SimpleNamespace(adopt_rollout_reporting=Mock())
+    for owner in (worker.reward_dispatcher, calculator):
+        initialize_reward_callbacks(owner, hooks, CallbackContext(role="reward"))
+    namespace["bind_report_source"](
+        worker, {"replica_name": "registered-trt", "global_rank": 6}
+    )
+    for owner in (worker.reward_dispatcher, calculator):
+        assert owner.reward_callbacks.context.replica_name == "registered-trt"
+        assert owner.validation_reward_callbacks.context.is_validation
+        assert owner.reward_callbacks.context.global_rank == 6
 
 
 def test_registered_annotation_takes_precedence_and_cleanup_composes_with_packer():
