@@ -150,6 +150,10 @@ def _warn_legacy_prefetch_hook_once() -> None:
     )
 
 
+def _is_rollout_only(config) -> bool:
+    return getattr(getattr(config, "rollout", None), "rollout_only", False) is True
+
+
 class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
     """
     DisaggregatedRolloutControlWorker will be a replica instance of single DP.
@@ -1450,7 +1454,8 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                     self.report_rollouts,
                     self.validation_flag,
                 )
-            self.prepare_shard_infos_for_weight_sync_insts()
+            if not _is_rollout_only(self.config):
+                self.prepare_shard_infos_for_weight_sync_insts()
 
             async_mode = get_async_r2r_sync_mode(self)
             if async_mode != AsyncR2RSyncMode.DISABLED:
@@ -2639,7 +2644,9 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
                 batch_version = required_weight_version(self._prompt_queue.queue[0])
                 allowed = self.config.train.train_policy.allowed_outdated_steps
                 ceiling = self.current_weight_version + allowed
-                is_valid_prompt_for_current_weight_version = batch_version <= ceiling
+                is_valid_prompt_for_current_weight_version = (
+                    _is_rollout_only(self.config) or batch_version <= ceiling
+                )
 
                 if not is_valid_prompt_for_current_weight_version:
                     self._mainloop_branch_counts["version_fail"] += 1
@@ -3090,7 +3097,8 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
         if not is_validation and not self._prompt_queue.empty():
             batch_version = required_weight_version(self._prompt_queue.queue[0])
             is_valid_prompt_for_current_weight_version = (
-                batch_version
+                _is_rollout_only(self.config)
+                or batch_version
                 <= self.current_weight_version
                 + self.config.train.train_policy.allowed_outdated_steps
             )
@@ -3454,7 +3462,12 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
             ):
                 self.state.set_prompt_fetch_end()
 
-    def work(self):
+    def _work_impl(self):
+        if _is_rollout_only(self.config):
+            # There is no trainer to send the first weight command. Load the
+            # configured checkpoint/application model before admitting work.
+            self.lazy_initialize_rollout_engine(load_format="auto")
+            self.state.set_weight_synced()
         # Start the thread with daemon=True, so it will exit when the main program exits.
         if self.global_rank == 0:
             # create a thread to query command as a producer
@@ -3499,12 +3512,15 @@ class DisaggregatedRolloutControlWorker(RolloutWorkerBase):
             )
             self.teacher_interact_thread.start()
 
+        self.main_loop()
+        scheduler = getattr(self, "scheduler", None)
+        raise_scheduler_failure = getattr(scheduler, "raise_if_failed", None)
+        if callable(raise_scheduler_failure):
+            raise_scheduler_failure()
+
+    def work(self):
         try:
-            self.main_loop()
-            scheduler = getattr(self, "scheduler", None)
-            raise_scheduler_failure = getattr(scheduler, "raise_if_failed", None)
-            if callable(raise_scheduler_failure):
-                raise_scheduler_failure()
+            self._work_impl()
         except BaseException:
             try:
                 self.handle_shutdown()
