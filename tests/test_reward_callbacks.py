@@ -412,11 +412,12 @@ def test_registered_reward_callbacks_reach_remote_and_bypass_paths(path):
 
 def test_trtllm_setup_forwards_registered_callbacks_without_importing_backend():
     import ast
+    from importlib.util import find_spec
     from pathlib import Path
 
     source = (
-        Path(__file__).resolve().parents[1]
-        / "cosmos_rl/rollout/trtllm_rollout/trtllm_rollout_wrapper.py"
+        Path(find_spec("cosmos_rl").origin).parent
+        / "rollout/trtllm_rollout/trtllm_rollout_wrapper.py"
     )
     module = ast.parse(source.read_text())
     wrapper = next(
