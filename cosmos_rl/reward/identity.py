@@ -83,8 +83,7 @@ class CompletionReporter:
             ) != len(payload.completions):
                 raise ValueError("Reward processing lost completion diagnostics")
             diagnostics.extend(
-                payload.completion_diagnostics
-                or [None] * len(payload.completions)
+                payload.completion_diagnostics or [None] * len(payload.completions)
             )
             for rejection in payload.completion_rejections:
                 # Use the same application serializer for rejected references.
